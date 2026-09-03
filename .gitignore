@@ -7,3 +7,8 @@ target/
 .DS_Store
 *.pyc
 dependency-reduced-pom.xml
+
+# Clojure / clj-kondo build and cache artifacts
+.cpcache/
+.clj-kondo/
+.nrepl-port

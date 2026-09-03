@@ -2,16 +2,66 @@
  ["src" "resources"]
 
  :deps
- {com.aliyun.odps/odps-jdbc {:mvn/version "3.10.0"}}
+ {com.aliyun.odps/odps-jdbc
+  {:mvn/version "3.10.0"
+   ;; Metabase uses its own git forks of redux, malli, and pp; exclude the Maven
+   ;; versions transitively pulled in by odps-jdbc to avoid "Unable to compare
+   ;; versions" deps conflicts when merging with metabase-core's deps.
+   :exclusions [redux/redux
+                metosin/malli
+                io.github.eerohele/pp]}
+  ;; Re-declare Metabase's git forks here so tools.deps sees a consistent manifest
+  ;; (git) instead of trying to mix git vs Maven versions.
+  redux/redux
+  {:git/url "https://github.com/metabase/redux"
+   :sha     "4a37feaf817a2a6b5ef688c927f6fd4375964433"}
+  metosin/malli
+  {:git/url "https://github.com/metabase/malli"
+   :sha     "b4a2d78647a049870b316753d7aae7fb4ade3ae5"}
+  io.github.eerohele/pp
+  {:git/url "https://github.com/eerohele/pp"
+   :sha     "ffc4edc482c057cd9412c62f018a41e9140c618b"}}
 
- ;; build the driver with clojure -X:build
+ ;; Maven repos from subprojects do not get copied over with :local/root
+ ;; (see comment in metabase/deps.edn). Re-declare the extras Metabase needs.
+ :mvn/repos
+ {"metabase-maven-downloads" {:url "https://s3.amazonaws.com/metabase-maven-downloads"}
+  "redshift"                 {:url "https://s3.amazonaws.com/redshift-maven-repository/release"}
+  ;; for metabase/saml20-clj
+  "opensaml"                 {:url "https://build.shibboleth.net/nexus/content/repositories/releases/"}}
+
+ ;; build the driver with:
+ ;;   clojure -X:build
+ ;;
+ ;; This alias pulls in the local Metabase checkout (metabase-core) and the
+ ;; build-drivers tooling (bin/build/src). Adjust the :local/root path below
+ ;; if your Metabase checkout lives elsewhere.
  :aliases
  {:build
-  ;; to avoid hardcoding these paths in the project-level deps file, an alias pointing to these extra-deps can be defined in user-specific ~/.clojure/deps.edn
-  ;; files instead; suppose we do so, and call it :metabase-core-deps, then we can simply add :metabase-core-deps to the build invocation above
-  {:extra-deps {metabase/metabase-core {:local/root "~/metabase/"}
-                metabase/build-drivers {:local/root "~/metabase/bin/build-drivers.sh"}}
-   :exec-fn    build-drivers.build-driver/build-driver!
-   :exec-args  {:driver      :maxcompute
-                :project-dir "."
-                :target-dir  "./target"}}}}
+  {:extra-deps   {metabase/metabase-core {:local/root "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/metabase/"}
+                  ;; The build-drivers tooling (metabase/bin/build/src) depends on these
+                  ;; libraries, which are declared in metabase's own :build alias. Since
+                  ;; :local/root does not pull in alias deps, re-declare them here
+                  ;; (mirrors metabase's :build alias :extra-deps).
+                  com.bhauman/spell-spec            {:mvn/version "0.1.2"}
+                  expound/expound                   {:mvn/version "0.9.0"}
+                  io.github.borkdude/grasp          {:mvn/version "0.1.4"}
+                  io.github.clojure/tools.build     {:mvn/version "0.10.11"}
+                  io.github.seancorfield/build-uber-log4j2-handler
+                  {:git/tag "v2.25.1" :git/sha "1cfab45"}
+                  org.clojure/data.xml              {:mvn/version "0.2.0-alpha10"}
+                  org.clojure/tools.deps.alpha      {:mvn/version "0.15.1254"}
+                  org.fedorahosted.tennera/jgettext {:mvn/version "0.15.1"}}
+   :extra-paths  ["/Users/martini/Documents/Dev/maxcompute-metabase-plugin/metabase/bin/build/src"
+                   "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/metabase/bin/build/resources"]
+   :exec-fn      build-drivers.build-driver/build-driver!
+   :exec-args    {:driver      :maxcompute
+                  :project-dir "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/aliyun-maxcompute-data-collectors/metabase-maxcompute-driver"
+                  :target-dir  "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/aliyun-maxcompute-data-collectors/metabase-maxcompute-driver/target"}}
+
+  ;; Run tests with:
+  ;;   clojure -X:test
+  ;; (requires the Metabase checkout on the classpath — combine with :build or
+  ;; run from the Metabase repo root with this driver on the classpath)
+  :test
+  {:extra-paths ["test"]}}}

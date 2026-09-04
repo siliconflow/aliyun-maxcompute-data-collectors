@@ -11,7 +11,9 @@ on:
 env:
   METABASE_TAG: v0.63.16
   JAVA_VERSION: "25"
-  CLOJURE_VERSION: "1.12.3.1539"
+  # Must be a real release over at https://github.com/clojure/brew-install/releases
+  # (linux-install.sh downloads exactly this version's tarball with retry).
+  CLOJURE_VERSION: "1.12.6.1673"
 
 jobs:
   build-and-test:
@@ -35,10 +37,15 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: temurin
 
-      - name: Install Clojure CLI
-        uses: DeLaGuardo/setup-clojure@13.1
-        with:
-          cli: ${{ env.CLOJURE_VERSION }}
+      - name: Install Clojure CLI ${{ env.CLOJURE_VERSION }}
+        run: |
+          curl -fsSL https://download.clojure.org/install/linux-install.sh -o /tmp/linux-install.sh
+          chmod +x /tmp/linux-install.sh
+          sudo /tmp/linux-install.sh
+          # Guards against silent install failure: fail here, not later as
+          # "clojure: command not found" in the build step.
+          clojure -Sdescribe | tee /tmp/clj-desc.txt | head -4
+          grep -q "\"${CLOJURE_VERSION}\"" /tmp/clj-desc.txt || { echo "ERROR: installed CLI is not ${CLOJURE_VERSION}"; exit 1; }
 
       - name: Cache Maven and Clojure deps
         uses: actions/cache@v4

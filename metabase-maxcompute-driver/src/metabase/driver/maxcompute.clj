@@ -1,30 +1,17 @@
 (ns metabase.driver.maxcompute
     (:require
       [cheshire.core :as json]
-      [clojure.core]
       [clojure.string :as str]
       [honey.sql :as hsql]
-      [java-time.api :as t]
-      [metabase.driver :as driver]
-      [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
-      [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
-      [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
-      [metabase.driver.sql.query-processor :as sql.qp]
-      [metabase.lib.metadata :as lib.metadata]
-      [metabase.query-processor.error-type :as qp.error-type]
-      [metabase.query-processor.store :as qp.store]
-      [metabase.query-processor.timezone :as qp.timezone]
-      [metabase.query-processor.util.add-alias-info :as add]
-      [metabase.util.date-2 :as u.date]
-      [metabase.driver.sql.util.unprepare :as unprepare]
-      [metabase.util.honey-sql-2 :as h2x]
-      [metabase.legacy-mbql.util :as mbql.u]
-      [clojure.string :as str]
       [honey.sql :as sql]
       [java-time.api :as t]
       [metabase.driver :as driver]
       [metabase.driver.common :as driver.common]
       [metabase.driver.sql :as driver.sql]
+      [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+      [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+      [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
+      [metabase.driver-api.core :as driver-api]
       [metabase.driver.sql.parameters.substitution :as sql.params.substitution]
       [metabase.driver.sql.query-processor :as sql.qp]
       [metabase.driver.sql.util :as sql.u]
@@ -32,22 +19,21 @@
       [metabase.legacy-mbql.util :as mbql.u]
       [metabase.lib.metadata :as lib.metadata]
       [metabase.lib.schema.metadata :as lib.schema.metadata]
-      [metabase.models.setting :as setting]
       [metabase.query-processor.error-type :as qp.error-type]
       [metabase.query-processor.store :as qp.store]
       [metabase.query-processor.timezone :as qp.timezone]
       [metabase.query-processor.util.add-alias-info :as add]
+      [metabase.secrets.core :as secrets]
+      [metabase.settings.models.setting :as setting]
       [metabase.util :as u]
       [metabase.util.date-2 :as u.date]
       [metabase.util.honey-sql-2 :as h2x]
       [metabase.util.i18n :refer [tru]]
       [metabase.util.log :as log]
-      [metabase.util.malli :as mu]
-      [metabase.models.secret :as secret])
+      [metabase.util.malli :as mu])
     (:import
       (java.sql Connection ResultSet Time)
       (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime Instant)
-      (metabase.driver.common.parameters FieldFilter)
       (java.util Date)
       (com.aliyun.odps Column Table Project Odps OdpsException)
       (com.aliyun.odps.jdbc OdpsConnection)
@@ -55,7 +41,18 @@
 
 (set! *warn-on-reflection* true)
 
-(driver/register! :maxcompute, :parent :sql-jdbc)
+;; Auto-detect whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x
+;; has it; master removed it in PR #77529, with :sql directly using MBQL5
+;; compilation). Register with :sql-mbql5 parent when available so the driver
+;; opts into MBQL5 compilation on older Metabase; on master, :sql-jdbc alone
+;; suffices since :sql now uses MBQL5 directly.
+(let [mbql5-available? (try
+                         (require '[metabase.driver.sql-mbql5])
+                         true
+                         (catch Throwable _ false))]
+  (driver/register! :maxcompute, :parent (if mbql5-available?
+                                           #{:sql-jdbc :sql-mbql5}
+                                           :sql-jdbc)))
 (doseq [[feature supported?] {;; Does this database support following foreign key relationships while querying?
                               ;; Note that this is different from supporting primary key and foreign key constraints in the schema; see below.
                               :foreign-keys                           false
@@ -227,8 +224,7 @@
 (defmethod driver/can-connect? :maxcompute
            [driver details]
            (let [{:keys [project endpoint ak sk namespace-schema]} details
-                 account (AliyunAccount. ak (-> details (secret/db-details-prop->secret-map "sk")
-                                                secret/value->string))
+                 account (AliyunAccount. ak (secrets/value-as-string driver details "sk"))
                  odps (Odps. account)]
                 (.setEndpoint odps endpoint)
                 (.setDefaultProject odps project)
@@ -255,9 +251,7 @@
                                    "odps.namespace.schema"           "true"
                                    "odps.sql.bigquery.compatible"    "true"
                                    "odps.sql.timezone"               (or timezone "Asia/Shanghai")}
-                 sk-value (-> details-map
-                              (secret/db-details-prop->secret-map "sk")
-                              secret/value->string)
+                 sk-value (secrets/value-as-string driver details-map "sk")
                  settings-map (merge default-settings (try
                                                         (when settings
                                                               (json/parse-string settings true))
@@ -486,7 +480,7 @@
 
 (defmulti ^:private temporal-type
           {:arglists '([x])}
-          mbql.u/dispatch-by-clause-name-or-class
+          driver-api/dispatch-by-clause-name-or-class
           :hierarchy #'temporal-type-hierarchy)
 
 (defmethod temporal-type LocalDate      [_] :date)
@@ -581,7 +575,7 @@
           calling [[->temporal-type]]); and should return a Honey SQL form."
           {:arglists '([target-type x])}
           (fn [target-type x]
-              [target-type (mbql.u/dispatch-by-clause-name-or-class x)])
+              [target-type (driver-api/dispatch-by-clause-name-or-class x)])
           :hierarchy #'temporal-type-hierarchy)
 
 (defn- throw-unsupported-conversion [from to]
@@ -908,8 +902,24 @@
                           true                                    (vary-meta assoc ::do-not-qualify? true))))
 
 (defmethod sql.qp/->honeysql [:maxcompute :field]
-           [driver [_field _id-or-name {::add/keys [source-table], :as _opts} :as field-clause]]
-           (let [parent-method (get-method sql.qp/->honeysql [:sql :field])]
+           [driver field-clause]
+           ;; :field clause order differs between Metabase versions:
+           ;;   - master (PR #77529+):  [:field opts id-or-name]
+           ;;   - v0.63.x and earlier:  [:field id-or-name opts]
+           ;; The parent method [:sql :field] destructures according to its own version's order, so
+           ;; we pass `field-clause` through unchanged. We only need to extract `source-table` from
+           ;; `opts` here for the join/source-query binding below.
+           (let [mbql5?        (try
+                                 (require '[metabase.driver.sql-mbql5])
+                                 true
+                                 (catch Throwable _ false))
+                 opts          (if mbql5?
+                                 ;; v0.63.x: [:field id-or-name opts] — opts at index 2
+                                 (nth field-clause 2)
+                                 ;; master:  [:field opts id-or-name] — opts at index 1
+                                 (nth field-clause 1))
+                 source-table  (::add/source-table opts)
+                 parent-method (get-method sql.qp/->honeysql [:sql :field])]
                 ;; if the Field is from a join or source table, record this fact so that we know never to qualify it with the
                 ;; project ID no matter what
                 (binding [*field-is-from-join-or-source-query?* (not (integer? source-table))]
@@ -999,7 +1009,10 @@
                        u/remove-diacritical-marks
                        (str/replace #"[^\w\d_]" "_")
                        (str/replace #"(^\d)" "_$1"))]
-                ((get-method driver/escape-alias :sql) driver s)))
+                ;; :metabase.driver/driver is the default impl in metabase.driver, which calls
+                ;; driver.impl/truncate-alias. Can't use ::driver here because in this namespace
+                ;; it would resolve to :metabase.driver.maxcompute/driver.
+                ((get-method driver/escape-alias :metabase.driver/driver) driver s)))
 
 (defmethod unprepare/unprepare-value [:maxcompute String]
            [_ s]
@@ -1035,6 +1048,48 @@
 (defmethod unprepare/unprepare-value [:maxcompute ZonedDateTime]
            [_ t]
            (format "datetime\"%s %s\"" (u.date/format-sql (t/local-date-time t)) (.getId (t/zone-id t))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                             inline-value impls                                                |
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; sql.qp/inline-value is the v0.51+ mechanism for inlining temporal literals when *compile-with-inline-parameters*
+;;; is true (used for native query compilation and certain prepared-statement fallback paths). The syntax must match
+;;; unprepare-value above so MaxCompute accepts the literal in both code paths.
+
+(defmethod sql.qp/inline-value [:maxcompute String]
+  [_ s]
+  ;; escape single-quotes like Cam's String -> Cam\'s String
+  (str \' (str/replace s "'" "\\'") \'))
+
+(defmethod sql.qp/inline-value [:maxcompute LocalTime]
+  [_ t]
+  (format "datetime\"%s\"" (u.date/format-sql t)))
+
+(defmethod sql.qp/inline-value [:maxcompute LocalDate]
+  [_ t]
+  (format "date\"%s\"" (u.date/format-sql t)))
+
+(defmethod sql.qp/inline-value [:maxcompute LocalDateTime]
+  [_ t]
+  (format "timestamp\"%s\"" (u.date/format-sql t)))
+
+(defmethod sql.qp/inline-value [:maxcompute Instant]
+  [_ t]
+  (format "timestamp\"%s\"" (u.date/format-sql t)))
+
+(defmethod sql.qp/inline-value [:maxcompute OffsetTime]
+  [_ t]
+  ;; convert to a LocalTime in UTC
+  (let [local-time (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))]
+    (format "datetime\"%s\"" (u.date/format-sql local-time))))
+
+(defmethod sql.qp/inline-value [:maxcompute OffsetDateTime]
+  [_ t]
+  (format "datetime\"%s\"" (u.date/format-sql t)))
+
+(defmethod sql.qp/inline-value [:maxcompute ZonedDateTime]
+  [_ t]
+  (format "datetime\"%s %s\"" (u.date/format-sql (t/local-date-time t)) (.getId (t/zone-id t))))
 
 (def ^:private ^:dynamic *compiling-cumulative-aggregation* false)
 
@@ -1257,12 +1312,12 @@
 ;           [driver t]
 ;           (driver.sql/->prepared-substitution driver (t/zoned-date-time result (t/zone-id "UTC"))))
 
-(mu/defmethod sql.params.substitution/->replacement-snippet-info [:maxcompute FieldFilter]
+(mu/defmethod sql.params.substitution/->replacement-snippet-info [:maxcompute :metabase.lib.parameters.parse.types/field-filter]
               [driver                            :- :keyword
                {:keys [field], :as field-filter} :- [:map
                                                      [:field ::lib.schema.metadata/column]]]
               (let [field-temporal-type (temporal-type field)
-                    parent-method       (get-method sql.params.substitution/->replacement-snippet-info [:sql FieldFilter])
+                    parent-method       (get-method sql.params.substitution/->replacement-snippet-info [:sql :metabase.lib.parameters.parse.types/field-filter])
                     result              (parent-method driver field-filter)]
                    (cond-> result
                            field-temporal-type (update :prepared-statement-args (fn [args]

@@ -59,6 +59,18 @@ jobs:
             ${{ runner.os }}-deps-${{ env.METABASE_TAG }}-
             ${{ runner.os }}-deps-
 
+      # metabase.util.log reads .clj-kondo/config/modules/config.edn
+      # (relative to the JVM working directory) when not running from a jar.
+      # The build compiles driver code against metabase-core from the local
+      # checkout, so the file must resolve from the driver directory.
+      - name: Link metabase module config into driver dir
+        run: |
+          SRC="$GITHUB_WORKSPACE/metabase/.clj-kondo/config/modules/config.edn"
+          test -f "$SRC" || { echo "missing $SRC"; exit 1; }
+          mkdir -p repo/metabase-maxcompute-driver/.clj-kondo/config/modules
+          ln -sfn "$SRC" repo/metabase-maxcompute-driver/.clj-kondo/config/modules/config.edn
+          cat repo/metabase-maxcompute-driver/.clj-kondo/config/modules/config.edn >/dev/null && echo "symlink resolves OK"
+
       - name: Build driver JAR
         working-directory: repo/metabase-maxcompute-driver
         run: |

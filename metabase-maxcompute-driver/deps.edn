@@ -31,14 +31,22 @@
   "opensaml"                 {:url "https://build.shibboleth.net/nexus/content/repositories/releases/"}}
 
  ;; build the driver with:
- ;;   clojure -X:build
+ ;;   clojure -X:build :project-dir "$(pwd)" :target-dir "$(pwd)/target"
  ;;
  ;; This alias pulls in the local Metabase checkout (metabase-core) and the
- ;; build-drivers tooling (bin/build/src). Adjust the :local/root path below
- ;; if your Metabase checkout lives elsewhere.
+ ;; build-drivers tooling (bin/build/src). The :local/root path below is
+ ;; relative to this deps.edn file: `../../metabase` expects the metabase
+ ;; checkout to live two directories up, as a sibling of this repository.
+ ;;
+ ;; :project-dir and :target-dir MUST be absolute paths — the build-drivers
+ ;; tool asserts that :paths (resolved under :project-dir) are absolute, and
+ ;; passing a relative path like "." causes (filename "." "src") = "./src",
+ ;; which fails that assertion. Override them on the command line with the
+ ;; absolute path of the driver directory, e.g. from this directory:
+ ;;   clojure -X:build :project-dir "\"$PWD\"" :target-dir "\"$PWD/target\""
  :aliases
  {:build
-  {:extra-deps   {metabase/metabase-core {:local/root "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/metabase/"}
+  {:extra-deps   {metabase/metabase-core {:local/root "../../metabase"}
                   ;; The build-drivers tooling (metabase/bin/build/src) depends on these
                   ;; libraries, which are declared in metabase's own :build alias. Since
                   ;; :local/root does not pull in alias deps, re-declare them here
@@ -52,12 +60,10 @@
                   org.clojure/data.xml              {:mvn/version "0.2.0-alpha10"}
                   org.clojure/tools.deps.alpha      {:mvn/version "0.15.1254"}
                   org.fedorahosted.tennera/jgettext {:mvn/version "0.15.1"}}
-   :extra-paths  ["/Users/martini/Documents/Dev/maxcompute-metabase-plugin/metabase/bin/build/src"
-                   "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/metabase/bin/build/resources"]
+   :extra-paths  ["../../metabase/bin/build/src"
+                   "../../metabase/bin/build/resources"]
    :exec-fn      build-drivers.build-driver/build-driver!
-   :exec-args    {:driver      :maxcompute
-                  :project-dir "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/aliyun-maxcompute-data-collectors/metabase-maxcompute-driver"
-                  :target-dir  "/Users/martini/Documents/Dev/maxcompute-metabase-plugin/aliyun-maxcompute-data-collectors/metabase-maxcompute-driver/target"}}
+   :exec-args    {:driver :maxcompute}}
 
   ;; Run tests with:
   ;;   clojure -X:test

@@ -41,7 +41,18 @@
 
 (set! *warn-on-reflection* true)
 
-(driver/register! :maxcompute, :parent :sql-jdbc)
+;; Auto-detect whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x
+;; has it; master removed it in PR #77529, with :sql directly using MBQL5
+;; compilation). Register with :sql-mbql5 parent when available so the driver
+;; opts into MBQL5 compilation on older Metabase; on master, :sql-jdbc alone
+;; suffices since :sql now uses MBQL5 directly.
+(let [mbql5-available? (try
+                         (require '[metabase.driver.sql-mbql5])
+                         true
+                         (catch Throwable _ false))]
+  (driver/register! :maxcompute, :parent (if mbql5-available?
+                                           #{:sql-jdbc :sql-mbql5}
+                                           :sql-jdbc)))
 (doseq [[feature supported?] {;; Does this database support following foreign key relationships while querying?
                               ;; Note that this is different from supporting primary key and foreign key constraints in the schema; see below.
                               :foreign-keys                           false
@@ -891,8 +902,24 @@
                           true                                    (vary-meta assoc ::do-not-qualify? true))))
 
 (defmethod sql.qp/->honeysql [:maxcompute :field]
-           [driver [_field {::add/keys [source-table], :as _opts} _id-or-name :as field-clause]]
-           (let [parent-method (get-method sql.qp/->honeysql [:sql :field])]
+           [driver field-clause]
+           ;; :field clause order differs between Metabase versions:
+           ;;   - master (PR #77529+):  [:field opts id-or-name]
+           ;;   - v0.63.x and earlier:  [:field id-or-name opts]
+           ;; The parent method [:sql :field] destructures according to its own version's order, so
+           ;; we pass `field-clause` through unchanged. We only need to extract `source-table` from
+           ;; `opts` here for the join/source-query binding below.
+           (let [mbql5?        (try
+                                 (require '[metabase.driver.sql-mbql5])
+                                 true
+                                 (catch Throwable _ false))
+                 opts          (if mbql5?
+                                 ;; v0.63.x: [:field id-or-name opts] — opts at index 2
+                                 (nth field-clause 2)
+                                 ;; master:  [:field opts id-or-name] — opts at index 1
+                                 (nth field-clause 1))
+                 source-table  (::add/source-table opts)
+                 parent-method (get-method sql.qp/->honeysql [:sql :field])]
                 ;; if the Field is from a join or source table, record this fact so that we know never to qualify it with the
                 ;; project ID no matter what
                 (binding [*field-is-from-join-or-source-query?* (not (integer? source-table))]

@@ -1,0 +1,89 @@
+name: Build and Test MaxCompute Driver
+
+on:
+  push:
+    branches:
+      - feat/maxcompute-mbql5-master
+  pull_request:
+    branches:
+      - feat/maxcompute-mbql5-master
+
+env:
+  METABASE_TAG: v0.63.16
+  JAVA_VERSION: "25"
+  CLOJURE_VERSION: "1.12.3.1539"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout driver repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Checkout Metabase at tag ${{ env.METABASE_TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: metabase/metabase
+          ref: ${{ env.METABASE_TAG }}
+          path: metabase
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Install Clojure CLI
+        uses: DeLaGuardo/setup-clojure@13.1
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Maven and Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            **/.cpcache
+          key: ${{ runner.os }}-deps-${{ env.METABASE_TAG }}-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-${{ env.METABASE_TAG }}-
+            ${{ runner.os }}-deps-
+
+      - name: Build driver JAR
+        working-directory: repo/metabase-maxcompute-driver
+        run: |
+          clojure -X:build \
+            :project-dir "\"$PWD\"" \
+            :target-dir  "\"$PWD/target\""
+
+      - name: Verify JAR structure
+        working-directory: repo/metabase-maxcompute-driver
+        run: |
+          JAR="target/maxcompute.metabase-driver.jar"
+          echo "Checking JAR: $JAR"
+          test -f "$JAR" || { echo "JAR not found"; exit 1; }
+          jar tf "$JAR" | grep -q "^metabase-plugin.yaml$" || { echo "metabase-plugin.yaml missing"; exit 1; }
+          jar tf "$JAR" | grep -q "^metabase/driver/maxcompute__init.class$" || { echo "init class missing"; exit 1; }
+          jar tf "$JAR" | grep -q "^com/aliyun/odps/jdbc/OdpsDriver.class$" || { echo "OdpsDriver class missing"; exit 1; }
+          if jar tf "$JAR" | grep -qE "^clojure/core__init.class|^clojure/core.clj"; then
+            echo "ERROR: JAR contains clojure core classes"; exit 1
+          fi
+          echo "JAR verification passed."
+
+      - name: Run unit tests
+        working-directory: metabase
+        run: |
+          clojure \
+            -Sdeps '{:aliases {:maxcompute {:extra-deps {maxcompute/maxcompute {:local/root "../repo/metabase-maxcompute-driver" :exclusions [metabase/metabase-core]}}, :extra-paths ["../repo/metabase-maxcompute-driver/test"]}}}' \
+            -X:dev:test:maxcompute \
+            :only metabase.driver.maxcompute-test
+
+      - name: Upload driver JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: maxcompute-driver-${{ env.METABASE_TAG }}
+          path: repo/metabase-maxcompute-driver/target/maxcompute.metabase-driver.jar
+          retention-days: 30

@@ -28,9 +28,18 @@
   (testing ":maxcompute is registered with :sql-jdbc parent (derives from :sql as well)"
     ;; `isa?` against driver/hierarchy is the structural check; `driver/initialized?` is a runtime
     ;; state check that requires `driver/initialize!` to have run, which doesn't happen in unit tests.
-    ;; Note: :sql-mbql5 was removed in master (PR #77529) — :sql now uses mbql5 compilation directly.
+    ;; The driver auto-detects whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x has it;
+    ;; master removed it in PR #77529). When present, the driver registers with :sql-mbql5 as an
+    ;; additional parent; when absent, :sql-jdbc alone suffices.
     (is (isa? driver/hierarchy :maxcompute :sql-jdbc))
-    (is (isa? driver/hierarchy :maxcompute :sql))))
+    (is (isa? driver/hierarchy :maxcompute :sql))
+    (let [mbql5-present? (try
+                           (require 'metabase.driver.sql-mbql5)
+                           true
+                           (catch Throwable _ false))]
+      (is (= mbql5-present?
+             (isa? driver/hierarchy :maxcompute :sql-mbql5))
+          ":sql-mbql5 derivation should match namespace availability"))))
 
 (deftest ^:parallel escape-alias-test
   (testing "escape-alias converts aliases to valid MaxCompute identifiers"
@@ -107,14 +116,26 @@
     ;; :field impl looks up table metadata via qp.store; wrap with a mock provider so the store is initialized.
     ;; Use a real field id from the test metadata and supply ::add/source-table so the parent method can resolve
     ;; the field's table.
-    ;; Note: MBQL5 :field clause order is [:field opts id-or-name] (opts before id-or-name).
-    (qp.store/with-metadata-provider lib.test-md/metadata-provider
-      (is (some? (sql.qp/->honeysql :maxcompute
-                                    [:field {:base-type                :type/Text
-                                             ::add/source-table        (lib.test-md/id :venues)
-                                             ::add/source-alias        "NAME"
-                                             :lib/uuid                 "test-uuid"}
-                                     (lib.test-md/id :venues :name)]))))))
+    ;; Note: :field clause order differs between Metabase versions:
+    ;;   - master (PR #77529+):  [:field opts id-or-name]
+    ;;   - v0.63.x and earlier:  [:field id-or-name opts]
+    ;; Detect which order to use based on sql-mbql5 availability (removed in master).
+    (let [field-id   (lib.test-md/id :venues :name)
+          field-opts {:base-type         :type/Text
+                      ::add/source-table (lib.test-md/id :venues)
+                      ::add/source-alias "NAME"
+                      :lib/uuid          "test-uuid"}
+          mbql5?     (try
+                       (require 'metabase.driver.sql-mbql5)
+                       true
+                       (catch Throwable _ false))
+          field-clause (if mbql5?
+                         ;; v0.63.x: [:field id-or-name opts]
+                         [:field field-id field-opts]
+                         ;; master: [:field opts id-or-name]
+                         [:field field-opts field-id])]
+      (qp.store/with-metadata-provider lib.test-md/metadata-provider
+        (is (some? (sql.qp/->honeysql :maxcompute field-clause)))))))
 
 (deftest ^:parallel honeysql-now-smoke-test
   (testing "->honeysql for :now produces a HoneySQL form without throwing"

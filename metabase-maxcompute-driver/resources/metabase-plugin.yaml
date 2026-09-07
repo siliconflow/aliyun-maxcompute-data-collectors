@@ -18,25 +18,10 @@ info:
   # future we may use this description in a plugins admin page.
   description: Allows Metabase to connect to MaxCompute databases.
 
-# You can list any dependencies needed by the plugin by specifying a
-# list of dependencies. If all dependencies are not met, the plugin
-# will not be initialized.
-#
-# A dependency may be either a 'class' or (in the future) a 'plugin' dependency
-dependencies:
-
-  # A 'class' dependency checks whether a given class is available on
-  # the classpath. It doesn't initialize the class; Metabase defers initialization
-  # until it needs to use the driver
-  # Don't use this for classes that ship as part of the plugin itself;
-  # only use it for external dependencies.
-  - class: com.aliyun.odps.jdbc.OdpsDriver
-
-    # You may optionally add a message that will be displayed for
-    # information purposes in the logs, and possibly in a plugin
-    # management page as well in the future
-    message: >
-      Metabase requires the MaxCompute JDBC driver (>= 3.7.0) to connect to MaxCompute databases.
+# The MaxCompute JDBC driver (com.aliyun.odps.jdbc.OdpsDriver) ships inside this
+# plugin JAR, so there are no external dependencies to declare. The
+# `register-jdbc-driver` init step below loads the driver class from the JAR
+# after the plugin classloader is in place.
 
 # If a plugin adds a driver it should define a driver: section.
 #

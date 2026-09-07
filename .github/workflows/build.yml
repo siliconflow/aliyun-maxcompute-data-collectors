@@ -1,0 +1,140 @@
+name: Build and Test MaxCompute Driver
+
+on:
+  push:
+    branches:
+      - feat/maxcompute-mbql5-master
+      - master
+  pull_request:
+    branches:
+      - feat/maxcompute-mbql5-master
+      - master
+  workflow_dispatch:
+
+env:
+  METABASE_TAG: v0.63.16
+  JAVA_VERSION: "25"
+  # Must be a real release over at https://github.com/clojure/brew-install/releases
+  # (linux-install.sh downloads exactly this version's tarball with retry).
+  CLOJURE_VERSION: "1.12.6.1673"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout driver repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Checkout Metabase at tag ${{ env.METABASE_TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: metabase/metabase
+          ref: ${{ env.METABASE_TAG }}
+          path: metabase
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Install Clojure CLI ${{ env.CLOJURE_VERSION }}
+        run: |
+          curl -fsSL https://download.clojure.org/install/linux-install.sh -o /tmp/linux-install.sh
+          chmod +x /tmp/linux-install.sh
+          sudo /tmp/linux-install.sh
+          # Guards against silent install failure: fail here, not later as
+          # "clojure: command not found" in the build step.
+          clojure -Sdescribe | tee /tmp/clj-desc.txt | head -4
+          grep -q "\"${CLOJURE_VERSION}\"" /tmp/clj-desc.txt || { echo "ERROR: installed CLI is not ${CLOJURE_VERSION}"; exit 1; }
+
+      - name: Cache Maven and Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+            **/.cpcache
+          key: ${{ runner.os }}-deps-${{ env.METABASE_TAG }}-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-${{ env.METABASE_TAG }}-
+            ${{ runner.os }}-deps-
+
+      # metabase.util.log reads .clj-kondo/config/modules/config.edn
+      # (relative to the JVM working directory) when not running from a jar.
+      # The build compiles driver code against metabase-core from the local
+      # checkout, so the file must resolve from the driver directory.
+      - name: Link metabase module config into driver dir
+        run: |
+          SRC="$GITHUB_WORKSPACE/metabase/.clj-kondo/config/modules/config.edn"
+          test -f "$SRC" || { echo "missing $SRC"; exit 1; }
+          mkdir -p repo/metabase-maxcompute-driver/.clj-kondo/config/modules
+          ln -sfn "$SRC" repo/metabase-maxcompute-driver/.clj-kondo/config/modules/config.edn
+          cat repo/metabase-maxcompute-driver/.clj-kondo/config/modules/config.edn >/dev/null && echo "symlink resolves OK"
+
+      - name: Build driver JAR
+        working-directory: repo/metabase-maxcompute-driver
+        run: |
+          clojure -X:build \
+            :project-dir "\"$PWD\"" \
+            :target-dir  "\"$PWD/target\""
+
+      - name: Verify JAR structure
+        working-directory: repo/metabase-maxcompute-driver
+        run: |
+          JAR="target/maxcompute.metabase-driver.jar"
+          echo "Checking JAR: $JAR"
+          test -f "$JAR" || { echo "JAR not found"; exit 1; }
+          jar tf "$JAR" | grep -q "^metabase-plugin.yaml$" || { echo "metabase-plugin.yaml missing"; exit 1; }
+          jar tf "$JAR" | grep -q "^metabase/driver/maxcompute__init.class$" || { echo "init class missing"; exit 1; }
+          jar tf "$JAR" | grep -q "^com/aliyun/odps/jdbc/OdpsDriver.class$" || { echo "OdpsDriver class missing"; exit 1; }
+          if jar tf "$JAR" | grep -qE "^clojure/core__init.class|^clojure/core.clj"; then
+            echo "ERROR: JAR contains clojure core classes"; exit 1
+          fi
+          echo "JAR verification passed."
+
+      - name: Run unit tests
+        working-directory: metabase
+        run: |
+          clojure \
+            -Sdeps '{:aliases {:maxcompute {:extra-deps {maxcompute/maxcompute {:local/root "../repo/metabase-maxcompute-driver" :exclusions [metabase/metabase-core]}}, :extra-paths ["../repo/metabase-maxcompute-driver/test"]}}}' \
+            -X:dev:test:maxcompute \
+            :only metabase.driver.maxcompute-test
+
+      - name: Upload driver JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: maxcompute-driver-${{ env.METABASE_TAG }}
+          path: repo/metabase-maxcompute-driver/target/maxcompute.metabase-driver.jar
+          retention-days: 30
+
+      # Publish the driver JAR to a GitHub Release. Only for master pushes
+      # (the merge commit), so feature branch runs never publish. The tag is
+      # derived from the plugin version in metabase-plugin.yaml; the step
+      # fails the workflow if the version cannot be extracted.
+      - name: Publish JAR to GitHub Release (master only)
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(grep -E '^  version:' metabase-maxcompute-driver/resources/metabase-plugin.yaml | head -1 | sed -E 's/^  version:[[:space:]]*//')"
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: could not extract plugin version from metabase-plugin.yaml"; exit 1
+          fi
+          JAR="metabase-maxcompute-driver/target/maxcompute.metabase-driver.jar"
+          test -f "$JAR" || { echo "ERROR: JAR missing at $JAR"; exit 1; }
+          cp "$JAR" "maxcompute.metabase-driver-${VERSION}.jar"
+          gh release create "v${VERSION}" \
+            --title "MaxCompute Metabase Driver v${VERSION}" \
+            --notes "Metabase driver for MaxCompute, built against Metabase ${METABASE_TAG}.
+
+          Compatible with Metabase master (post PR #77529) and v0.63.x.
+
+          Install: drop the JAR into your Metabase plugins directory (\`MB_PLUGINS_DIR\` or \`./plugins\`, or \`/plugins\` in the Docker image) and restart." \
+            "maxcompute.metabase-driver-${VERSION}.jar" \
+            --repo "$GITHUB_REPOSITORY" || \
+          gh release upload "v${VERSION}" "maxcompute.metabase-driver-${VERSION}.jar" --clobber \
+            --repo "$GITHUB_REPOSITORY"

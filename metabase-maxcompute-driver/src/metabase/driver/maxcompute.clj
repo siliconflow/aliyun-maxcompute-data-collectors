@@ -776,12 +776,47 @@
            [_driver _unit expr]
            (extract :isoweek expr))
 
-(doseq [[unix-timestamp-type maxcompute-fn] {:seconds      :timestamp_seconds
-                                           :milliseconds :timestamp_millis
-                                           :microseconds :timestamp_micros}]
+;; 2026-09-07 fix: previous impl emitted `TIMESTAMP_MILLIS(x)` / `TIMESTAMP_SECONDS(x)`
+;; / `TIMESTAMP_MICROS(x)` built-ins — these DO NOT exist in MaxCompute (ODPS-0130071
+;; whether or not odps.sql.bigquery.compatible is set; verified against the live
+;; df_cs_673150 engine). Worse, the :sql default for :milliseconds fell through (as
+;; in the visible-query-builder bug) to `FROM_UNIXTIME(x / 1000.0)`: `/` on integer
+;; operands returns DOUBLE in MaxCompute, and FROM_UNIXTIME only takes BIGINT, so
+;; compilation fails with ODPS-0130121.
+;;
+;; Engine-verified replacements (all read-only tested 2026-09-07):
+;;   :seconds      → CAST(FROM_UNIXTIME(CAST(x AS BIGINT)) AS TIMESTAMP)   — exact
+;;   :milliseconds → CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(x / 1000 AS BIGINT)),'yyyy-mm-dd hh:mi:ss'),
+;;                             '.', LPAD(CAST(x % 1000 AS STRING), 3, '0')) AS TIMESTAMP)
+;;                   CAST(x / 1000 AS BIGINT) truncates toward zero == DIV; `%` keeps ms.
+;;   :microseconds → same shape with 1e6/6-digit padding.
+;; CAST(DATETIME AS TIMESTAMP) and CAST(STRING AS TIMESTAMP) (fractional seconds ok)
+;; are both supported conversions; MOD must use the `%` operator (MaxCompute has no
+;; MOD function — ODPS-0130071 on `mod(x,y)`).
+(defn- unix-s->honeysql
+  [expr]
+  (h2x/cast :timestamp [:from_unixtime (h2x/cast :bigint expr)]))
+
+(defn- split-unix-n
+  "Shared shape for ms/µs: seconds via BIGINT-truncating division (`CAST(x / N AS BIGINT)`
+  truncates toward zero, same as DIV), remainder via `%`; recombined as a
+  'yyyy-mm-dd hh:mi:ss.f{digits}' string and cast to TIMESTAMP. `digits` is 3 (ms) or 6 (µs)."
+  [expr divisor digits]
+  (let [divisor-expr [:inline divisor]
+        seconds      (h2x/cast :bigint (h2x// expr divisor-expr))
+        frac         (h2x/mod expr divisor-expr)
+        datetime-str [:concat
+                      [:to_char [:from_unixtime seconds] (h2x/literal "yyyy-mm-dd hh:mi:ss")]
+                      (h2x/literal ".")
+                      [:lpad [:cast frac :string] [:inline digits] (h2x/literal "0")]]]
+    (h2x/cast :timestamp datetime-str)))
+
+(doseq [[unix-timestamp-type impl-fn] {:seconds      unix-s->honeysql
+                                       :milliseconds #(split-unix-n % 1000 3)
+                                       :microseconds #(split-unix-n % 1000000 6)}]
        (defmethod sql.qp/unix-timestamp->honeysql [:maxcompute unix-timestamp-type]
                   [_driver _unix-timestamp-type expr]
-                  (-> [maxcompute-fn expr]
+                  (-> (impl-fn expr)
                       (with-temporal-type :timestamp)
                       (h2x/with-database-type-info "timestamp")
                       (with-temporal-type :timestamp))))

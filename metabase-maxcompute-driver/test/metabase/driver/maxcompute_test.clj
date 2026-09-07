@@ -146,3 +146,54 @@
     (let [form (sql.qp/current-datetime-honeysql-form :maxcompute)]
       (is (some? form))
       (is (some? (sql/format-expr form {:nested true}))))))
+
+;;; 2026-09-07 unix-timestamp->honeysql fix (ODPS-0130121 / ODPS-0130071 on real engine):
+;;; the old impl emitted nonexistent TIMESTAMP_MILLIS/SECONDS/MICROS built-ins. New impl must
+;;; produce engine-verified SQL shapes (see maxcompute.clj fix note). Rendering here is with
+;;; the default :ansi dialect; the driver's quote-style (:mysql) only affects identifiers.
+
+(defn- format-unix-ts [unit expr]
+  (sql/format-expr (sql.qp/unix-timestamp->honeysql :maxcompute unit expr)
+                   {:nested true :quoting :mysql}))
+
+(deftest ^:parallel unix-timestamp->honeysql-seconds-test
+  (testing ":seconds compiles to FROM_UNIXTIME with a BIGINT-cast arg inside CAST(... AS TIMESTAMP)"
+    (is (= ["CAST(FROM_UNIXTIME(CAST(`t`.`x` AS bigint)) AS timestamp)"]
+           (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute
+                                [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+
+(deftest ^:parallel unix-timestamp->honeysql-milliseconds-test
+  (testing ":milliseconds compiles to the split-and-recombine shape, preserves fractional digits"
+    (let [[sql-str] (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute
+                                                     [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
+      (testing "shape"
+        (is (str/includes? sql-str "CAST("))
+        (is (str/includes? sql-str "FROM_UNIXTIME(CAST("))     ; seconds via BIGINT trunc (== DIV)
+        (testing "`%` for the fraction"
+          (is (re-find #"\(`t`\.`x` % 1000\)" sql-str)))
+        (testing "3-digit zero padding via LPAD"
+          (is (str/includes? sql-str "LPAD(CAST((`t`.`x` % 1000) AS string), 3, '0')"))))))
+
+(deftest ^:parallel unix-timestamp->honeysql-subsecond-preserves-fraction-test
+  (testing "ms/µs render distinct shapes (3 vs 6 padding digits, 1000 vs 1000000 divisor)"
+    (let [[ms-str]  (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute
+                                                    [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          [us-str]  (format-unix-ts :microseconds (sql.qp/->honeysql :maxcompute
+                                                    [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
+      (is (re-find #"LPAD\([^)]*, 3" ms-str))
+      (is (re-find #"LPAD\([^)]*, 6" us-str))
+      (is (str/includes? ms-str "% 1000"))
+      (is (str/includes? us-str "% 1000000")))))
+
+(deftest ^:parallel unix-timestamp->honeysql-no-regression-test
+  (testing "the former broken forms are gone"
+    (let [[ms-str] (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute
+                                                    [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          [s-str]  (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute
+                                                  [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
+      (testing "never emits the DOUBLE-producing FROM_UNIXTIME(x / 1000.0) style (ODPS-0130121)"
+        (is (not (re-find #"FROM_UNIXTIME\(`t`\.`x` / 1000" s-str)))
+        (is (not (re-find #"1000\.0" ms-str))))
+      (testing "never emits nonexistent BigQuery built-ins (ODPS-0130071)"
+        (is (not (str/includes? (str/upper-case ms-str) "TIMESTAMP_MILLIS")))
+        (is (not (str/includes? (str/upper-case s-str)  "TIMESTAMP_SECONDS"))))))

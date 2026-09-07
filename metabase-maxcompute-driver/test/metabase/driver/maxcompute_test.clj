@@ -161,39 +161,35 @@
     (is (= ["CAST(FROM_UNIXTIME(CAST(`t`.`x` AS bigint)) AS timestamp)"]
            (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute
                                 [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
-
 (deftest ^:parallel unix-timestamp->honeysql-milliseconds-test
   (testing ":milliseconds compiles to the split-and-recombine shape, preserves fractional digits"
-    (let [[sql-str] (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute
-                                                     [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
-      (testing "shape"
-        (is (str/includes? sql-str "CAST("))
-        (is (str/includes? sql-str "FROM_UNIXTIME(CAST("))     ; seconds via BIGINT trunc (== DIV)
-        (testing "`%` for the fraction"
-          (is (re-find #"\(`t`\.`x` % 1000\)" sql-str)))
-        (testing "3-digit zero padding via LPAD"
-          (is (str/includes? sql-str "LPAD(CAST((`t`.`x` % 1000) AS string), 3, '0')"))))))
+    (let [[sql-str] (format-unix-ts :milliseconds
+                                   (sql.qp/->honeysql :maxcompute
+                                                      [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
+      (is (str/includes? sql-str "CAST("))
+      (is (str/includes? sql-str "FROM_UNIXTIME(CAST(")) ;; seconds via BIGINT truncation (== DIV)
+      (is (re-find #"\(`t`\.`x` % 1000\)" sql-str))
+      (is (str/includes? sql-str "LPAD(CAST((`t`.`x` % 1000) AS string), 3, '0')")))))
 
 (deftest ^:parallel unix-timestamp->honeysql-subsecond-preserves-fraction-test
-  (testing "ms/µs render distinct shapes (3 vs 6 padding digits, 1000 vs 1000000 divisor)"
-    (let [[ms-str]  (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute
-                                                    [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
-          [us-str]  (format-unix-ts :microseconds (sql.qp/->honeysql :maxcompute
-                                                    [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
+  (testing "ms and us render distinct shapes (3 vs 6 padding digits, 1000 vs 1000000 divisor)"
+    (let [[ms-str] (format-unix-ts :milliseconds
+                                   (sql.qp/->honeysql :maxcompute
+                                                      [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          [us-str] (format-unix-ts :microseconds
+                                   (sql.qp/->honeysql :maxcompute
+                                                      [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
       (is (re-find #"LPAD\([^)]*, 3" ms-str))
       (is (re-find #"LPAD\([^)]*, 6" us-str))
       (is (str/includes? ms-str "% 1000"))
       (is (str/includes? us-str "% 1000000")))))
-
 (deftest ^:parallel unix-timestamp->honeysql-no-regression-test
   (testing "the former broken forms are gone"
-    (let [[ms-str] (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute
-                                                    [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
-          [s-str]  (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute
-                                                  [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
+    (let [ms-str (first (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])))
+          s-str  (first (format-unix-ts :seconds      (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])))]
       (testing "never emits the DOUBLE-producing FROM_UNIXTIME(x / 1000.0) style (ODPS-0130121)"
         (is (not (re-find #"FROM_UNIXTIME\(`t`\.`x` / 1000" s-str)))
         (is (not (re-find #"1000\.0" ms-str))))
       (testing "never emits nonexistent BigQuery built-ins (ODPS-0130071)"
         (is (not (str/includes? (str/upper-case ms-str) "TIMESTAMP_MILLIS")))
-        (is (not (str/includes? (str/upper-case s-str)  "TIMESTAMP_SECONDS"))))))
+        (is (not (str/includes? (str/upper-case s-str) "TIMESTAMP_SECONDS")))))))

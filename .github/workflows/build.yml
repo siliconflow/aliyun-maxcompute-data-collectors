@@ -4,9 +4,12 @@ on:
   push:
     branches:
       - feat/maxcompute-mbql5-master
+      - master
   pull_request:
     branches:
       - feat/maxcompute-mbql5-master
+      - master
+  workflow_dispatch:
 
 env:
   METABASE_TAG: v0.63.16
@@ -106,3 +109,32 @@ jobs:
           name: maxcompute-driver-${{ env.METABASE_TAG }}
           path: repo/metabase-maxcompute-driver/target/maxcompute.metabase-driver.jar
           retention-days: 30
+
+      # Publish the driver JAR to a GitHub Release. Only for master pushes
+      # (the merge commit), so feature branch runs never publish. The tag is
+      # derived from the plugin version in metabase-plugin.yaml; the step
+      # fails the workflow if the version cannot be extracted.
+      - name: Publish JAR to GitHub Release (master only)
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(grep -E '^  version:' metabase-maxcompute-driver/resources/metabase-plugin.yaml | head -1 | sed -E 's/^  version:[[:space:]]*//')"
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: could not extract plugin version from metabase-plugin.yaml"; exit 1
+          fi
+          JAR="metabase-maxcompute-driver/target/maxcompute.metabase-driver.jar"
+          test -f "$JAR" || { echo "ERROR: JAR missing at $JAR"; exit 1; }
+          cp "$JAR" "maxcompute.metabase-driver-${VERSION}.jar"
+          gh release create "v${VERSION}" \
+            --title "MaxCompute Metabase Driver v${VERSION}" \
+            --notes "Metabase driver for MaxCompute, built against Metabase ${METABASE_TAG}.
+
+          Compatible with Metabase master (post PR #77529) and v0.63.x.
+
+          Install: drop the JAR into your Metabase plugins directory (\`MB_PLUGINS_DIR\` or \`./plugins\`, or \`/plugins\` in the Docker image) and restart." \
+            "maxcompute.metabase-driver-${VERSION}.jar" \
+            --repo "$GITHUB_REPOSITORY" || \
+          gh release upload "v${VERSION}" "maxcompute.metabase-driver-${VERSION}.jar" --clobber \
+            --repo "$GITHUB_REPOSITORY"

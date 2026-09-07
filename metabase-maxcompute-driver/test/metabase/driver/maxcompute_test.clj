@@ -155,40 +155,29 @@
 (defn- format-unix-ts [unit expr]
   (sql/format-expr (sql.qp/unix-timestamp->honeysql :maxcompute unit expr)
                    {:nested true :quoting :mysql}))
-
 (deftest ^:parallel unix-timestamp->honeysql-seconds-test
   (testing ":seconds compiles to FROM_UNIXTIME with a BIGINT-cast arg inside CAST(... AS TIMESTAMP)"
-    (is (= ["CAST(FROM_UNIXTIME(CAST(`t`.`x` AS bigint)) AS timestamp)"]
-           (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute
-                                [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+    (is (= [ "CAST(FROM_UNIXTIME(CAST(t.x AS bigint)) AS timestamp)" ]
+           (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+
 (deftest ^:parallel unix-timestamp->honeysql-milliseconds-test
-  (testing ":milliseconds compiles to the split-and-recombine shape, preserves fractional digits"
-    (let [[sql-str] (format-unix-ts :milliseconds
-                                   (sql.qp/->honeysql :maxcompute
-                                                      [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
-      (is (str/includes? sql-str "CAST("))
-      (is (str/includes? sql-str "FROM_UNIXTIME(CAST(")) ;; seconds via BIGINT truncation (== DIV)
-      (is (re-find #"\(`t`\.`x` % 1000\)" sql-str))
-      (is (str/includes? sql-str "LPAD(CAST((`t`.`x` % 1000) AS string), 3, '0')")))))
+  (testing ":milliseconds compiles to the split-and-recombine shape with 3-digit fraction"
+    (is (= [ "CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(t.x / 1000 AS bigint)), 'yyyy-mm-dd hh:mi:ss'), '.', LPAD(CAST(t.x % 1000 AS STRING), 3, '0')) AS timestamp)" ]
+           (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
 
 (deftest ^:parallel unix-timestamp->honeysql-subsecond-preserves-fraction-test
   (testing "ms and us render distinct shapes (3 vs 6 padding digits, 1000 vs 1000000 divisor)"
-    (let [[ms-str] (format-unix-ts :milliseconds
-                                   (sql.qp/->honeysql :maxcompute
-                                                      [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
-          [us-str] (format-unix-ts :microseconds
-                                   (sql.qp/->honeysql :maxcompute
-                                                      [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))]
-      (is (re-find #"LPAD\([^)]*, 3" ms-str))
-      (is (re-find #"LPAD\([^)]*, 6" us-str))
-      (is (str/includes? ms-str "% 1000"))
-      (is (str/includes? us-str "% 1000000")))))
+    (is (= [ "CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(t.x / 1000 AS bigint)), 'yyyy-mm-dd hh:mi:ss'), '.', LPAD(CAST(t.x % 1000 AS STRING), 3, '0')) AS timestamp)" ]
+           (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))
+    (is (= [ "CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(t.x / 1000000 AS bigint)), 'yyyy-mm-dd hh:mi:ss'), '.', LPAD(CAST(t.x % 1000000 AS STRING), 6, '0')) AS timestamp)" ]
+           (format-unix-ts :microseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+
 (deftest ^:parallel unix-timestamp->honeysql-no-regression-test
   (testing "the former broken forms are gone"
     (let [ms-str (first (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])))
           s-str  (first (format-unix-ts :seconds      (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])))]
       (testing "never emits the DOUBLE-producing FROM_UNIXTIME(x / 1000.0) style (ODPS-0130121)"
-        (is (not (re-find #"FROM_UNIXTIME\(`t`\.`x` / 1000" s-str)))
+        (is (not (re-find #"FROM_UNIXTIME\(t\.x / 1000" s-str)))
         (is (not (re-find #"1000\.0" ms-str))))
       (testing "never emits nonexistent BigQuery built-ins (ODPS-0130071)"
         (is (not (str/includes? (str/upper-case ms-str) "TIMESTAMP_MILLIS")))

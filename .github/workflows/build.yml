@@ -1,5 +1,12 @@
 name: Build and Test MaxCompute Driver
 
+# `contents: write` lets the GITHUB_TOKEN create releases and tags.
+# Note: keys under `on:` (push/pull_request/workflow_dispatch) must come
+# before `env:` etc., but `permissions:` may sit anywhere top-level —
+# placing it here so the diff stays minimal.
+permissions:
+  contents: write
+
 on:
   push:
     branches:

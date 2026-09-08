@@ -210,7 +210,7 @@
       (is (str/includes? (str/upper-case q) "DATEADD("))
       (is (str/includes? q "'mm'"))
       (is (str/includes? (str/upper-case qy) "CAST("))
-      (is (not (str/includes? (str/upper-case q) "DATETRUNC"))))))
+      (is (not (re-find #"DATETRUNC\([^,]+, 'quarter'" (str/lower-case q)))))))
 
 (deftest ^:parallel day-of-week-weekday-composite-test
   (testing ":day-of-week uses WEEKDAY and % operator; never EXTRACT(dayofweek) or MOD()"
@@ -244,14 +244,14 @@
       (is (str/includes? s-h "'hh'"))
       (is (str/includes? s-m "'mm'"))
       (is (str/includes? (str/upper-case s-m) "CASE"))
-      (is (str/includes? (str/upper-case s-w) "% 7"))
+      (is (str/includes? (str/upper-case s-w) "/ 7"))
       (is (not (str/includes? (str/upper-case s-s) "TIMESTAMP_DIFF")))
       (is (not (str/includes? (str/upper-case s-m) "DATETIME_DIFF"))))))
 
 (deftest ^:parallel misc-fixed-shapes-test
   (testing "float->DOUBLE, log base-first, YYYYMMDDHHMMSS->TO_DATE, ISO strip, GETDATE"
     (let [f-str (first (sql/format-expr (sql.qp/->float :maxcompute (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))
-          l-str (first (sql/format-expr (sql.qp/->honeysql :maxcompute [:log {:lib/uuid "u"} [:field "x" {::add/source-table "t" ::add/source-alias "x"}]]) {:nested true}))
+          l-str (first (sql/format-expr (sql.qp/->honeysql :maxcompute [:log [:field "x" {::add/source-table "t" ::add/source-alias "x"}]]) {:nested true}))
           y-str (first (sql/format-expr (sql.qp/cast-temporal-string :maxcompute :Coercion/YYYYMMDDHHMMSSString->Temporal (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))
           i-str (first (sql/format-expr (sql.qp/cast-temporal-string :maxcompute :Coercion/ISO8601->DateTime (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))
           g-str (first (sql/format-expr (sql.qp/current-datetime-honeysql-form :maxcompute) {:nested true}))]

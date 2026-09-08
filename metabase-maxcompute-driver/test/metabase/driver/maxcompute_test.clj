@@ -67,18 +67,14 @@
   (testing ":maxcompute is registered with :sql-jdbc parent (derives from :sql as well)"
     ;; `isa?` against driver/hierarchy is the structural check; `driver/initialized?` is a runtime
     ;; state check that requires `driver/initialize!` to have run, which doesn't happen in unit tests.
-    ;; The driver auto-detects whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x has it;
-    ;; master removed it in PR #77529). When present, the driver registers with :sql-mbql5 as an
-    ;; additional parent; when absent, :sql-jdbc alone suffices.
+    ;; 2026-09-08 incident fix: the driver must NOT derive from :sql-mbql5 —
+    ;; its clause-order forwarding shims corrupt legacy 3-tuple :field clauses
+    ;; on v0.63.x (identifiers render with empty components; the bi.siliconflow.cn
+    ;; production breakage). See register comment in maxcompute.clj.
     (is (isa? driver/hierarchy :maxcompute :sql-jdbc))
     (is (isa? driver/hierarchy :maxcompute :sql))
-    (let [mbql5-present? (try
-                           (require 'metabase.driver.sql-mbql5)
-                           true
-                           (catch Throwable _ false))]
-      (is (= mbql5-present?
-             (isa? driver/hierarchy :maxcompute :sql-mbql5))
-          ":sql-mbql5 derivation should match namespace availability"))))
+    (is (not (isa? driver/hierarchy :maxcompute :sql-mbql5))
+        ":maxcompute must not derive from :sql-mbql5 (legacy-field reorder bug)")))
 
 (deftest ^:parallel escape-alias-test
   (testing "escape-alias converts aliases to valid MaxCompute identifiers"

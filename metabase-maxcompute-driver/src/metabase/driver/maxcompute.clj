@@ -41,18 +41,16 @@
 
 (set! *warn-on-reflection* true)
 
-;; Auto-detect whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x
-;; has it; master removed it in PR #77529, with :sql directly using MBQL5
-;; compilation). Register with :sql-mbql5 parent when available so the driver
-;; opts into MBQL5 compilation on older Metabase; on master, :sql-jdbc alone
-;; suffices since :sql now uses MBQL5 directly.
-(let [mbql5-available? (try
-                         (require '[metabase.driver.sql-mbql5])
-                         true
-                         (catch Throwable _ false))]
-  (driver/register! :maxcompute, :parent (if mbql5-available?
-                                           #{:sql-jdbc :sql-mbql5}
-                                           :sql-jdbc)))
+;; 2026-09-08 production-incident lesson: do NOT register :sql-mbql5 as a
+;; parent. On v0.63.x, [:sql-mbql5 :field]'s forwarding shims REORDER legacy
+;; three-tuple clauses ([:field id-or-name opts]) into MBQL5 order before
+;; [:sql :field] destructures them with the legacy order — the alias info
+;; lands on the wrong slots and identifiers come out with EMPTY components
+;; ([:identifier :field []]), which renders as `SELECT AS `_x_`` / one-blob
+;; FROM in production (queryHash e0bfeb…, bi.siliconflow.cn). The official
+;; OSS driver 0.1.0 registers :sql-jdbc only and does not hit this; v0.0.6
+;; did, because it opted into :sql-mbql5. Register like the official driver.
+(driver/register! :maxcompute, :parent :sql-jdbc)
 (doseq [[feature supported?] {;; Does this database support following foreign key relationships while querying?
                               ;; Note that this is different from supporting primary key and foreign key constraints in the schema; see below.
                               :foreign-keys                           false

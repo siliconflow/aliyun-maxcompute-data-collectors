@@ -47,13 +47,11 @@
                    :base-type :type/BigInteger :effective-type :type/DateTime
                    :coercion-strategy :Coercion/UNIXMilliseconds->DateTime}]})
     (driver/with-driver :maxcompute
-      (qp.compile/query->native
-        {:lib/type :mbql/query
-         :lib/metadata (qp.store/metadata-provider)
-         :database 1
-         :type :query
-         :query (lib/query-with-stage (qp.store/metadata-provider) 100 {:fields [[:field 1001]
-                                                                                [:field 1002]]})}))))
+      (:query
+       (qp.compile/compile
+         {:database 1
+          :type     :query
+          :query    {:fields [[:field 1001 nil] [:field 1002 nil]]}}))))
 
 (deftest integration-table-browse-sql-test
   (testing "table-browse MBQL query compiles to well-formed SQL: every field renders an expression, FROM is two-part"

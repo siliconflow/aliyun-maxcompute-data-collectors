@@ -146,3 +146,123 @@
     (let [form (sql.qp/current-datetime-honeysql-form :maxcompute)]
       (is (some? form))
       (is (some? (sql/format-expr form {:nested true}))))))
+
+;;; 2026-09-07 unix-timestamp->honeysql fix (ODPS-0130121 / ODPS-0130071 on real engine):
+;;; the old impl emitted nonexistent TIMESTAMP_MILLIS/SECONDS/MICROS built-ins. New impl must
+;;; produce engine-verified SQL shapes (see maxcompute.clj fix note). Rendering here is with
+;;; the default :ansi dialect; the driver's quote-style (:mysql) only affects identifiers.
+
+(defn- format-unix-ts [unit expr]
+  (sql/format-expr (sql.qp/unix-timestamp->honeysql :maxcompute unit expr)
+                   {:nested true :quoting :mysql}))
+(deftest ^:parallel unix-timestamp->honeysql-seconds-test
+  (testing ":seconds compiles to FROM_UNIXTIME with a BIGINT-cast arg inside CAST(... AS TIMESTAMP)"
+    (is (= [ "CAST(FROM_UNIXTIME(CAST(t.x AS bigint)) AS timestamp)" ]
+           (format-unix-ts :seconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+
+(deftest ^:parallel unix-timestamp->honeysql-milliseconds-test
+  (testing ":milliseconds compiles to the split-and-recombine shape with 3-digit fraction"
+    (is (= [ "CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(t.x / 1000 AS bigint)), 'yyyy-mm-dd hh:mi:ss'), '.', LPAD(CAST(t.x % 1000 AS STRING), 3, '0')) AS timestamp)" ]
+           (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+
+(deftest ^:parallel unix-timestamp->honeysql-subsecond-preserves-fraction-test
+  (testing "ms and us render distinct shapes (3 vs 6 padding digits, 1000 vs 1000000 divisor)"
+    (is (= [ "CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(t.x / 1000 AS bigint)), 'yyyy-mm-dd hh:mi:ss'), '.', LPAD(CAST(t.x % 1000 AS STRING), 3, '0')) AS timestamp)" ]
+           (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))
+    (is (= [ "CAST(CONCAT(TO_CHAR(FROM_UNIXTIME(CAST(t.x / 1000000 AS bigint)), 'yyyy-mm-dd hh:mi:ss'), '.', LPAD(CAST(t.x % 1000000 AS STRING), 6, '0')) AS timestamp)" ]
+           (format-unix-ts :microseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))))))
+
+(deftest ^:parallel unix-timestamp->honeysql-no-regression-test
+  (testing "the former broken forms are gone"
+    (let [ms-str (first (format-unix-ts :milliseconds (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])))
+          s-str  (first (format-unix-ts :seconds      (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])))]
+      (testing "never emits the DOUBLE-producing FROM_UNIXTIME(x / 1000.0) style (ODPS-0130121)"
+        (is (not (re-find #"FROM_UNIXTIME\(t\.x / 1000" s-str)))
+        (is (not (re-find #"1000\.0" ms-str))))
+      (testing "never emits nonexistent BigQuery built-ins (ODPS-0130071)"
+        (is (not (str/includes? (str/upper-case ms-str) "TIMESTAMP_MILLIS")))
+        (is (not (str/includes? (str/upper-case s-str) "TIMESTAMP_SECONDS")))))))
+
+;;; 2026-09-08 engine-audit regression tests (audit rounds A–AE, live engine):
+;;; every shape below was engine-verified before being asserted here.
+(deftest ^:parallel trunc-renders-short-tokens-test
+  (testing "DATETRUNC short token 'mi'; never 'minute'"
+    (let [form (sql.qp/date :maxcompute :minute (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          s (first (sql/format-expr form {:nested true}))]
+      (is (str/includes? s "DATETRUNC("))
+      (is (str/includes? s "'mi'"))
+      (is (not (str/includes? s "'minute'"))))))
+
+(deftest ^:parallel day-of-year-composite-test
+  (testing ":day-of-year via DATEDIFF composite; never EXTRACT(dayofyear)"
+    (let [form (sql.qp/date :maxcompute :day-of-year (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          s (first (sql/format-expr form {:nested true}))]
+      (is (str/includes? (str/upper-case s) "DATEDIFF("))
+      (is (str/includes? s "'dd'"))
+      (is (not (str/includes? (str/upper-case s) "DAYOFYEAR"))))))
+
+(deftest ^:parallel quarter-composite-test
+  (testing ":quarter month-shift composite"
+    (let [form (sql.qp/date :maxcompute :quarter (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          q (first (sql/format-expr form {:nested true}))
+          qy-form (sql.qp/date :maxcompute :quarter-of-year (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          qy (first (sql/format-expr qy-form {:nested true}))]
+      (is (str/includes? (str/upper-case q) "DATEADD("))
+      (is (str/includes? q "'mm'"))
+      (is (str/includes? (str/upper-case qy) "CAST("))
+      (is (not (re-find #"DATETRUNC\([^,]+, 'quarter'" (str/lower-case q)))))))
+
+(deftest ^:parallel day-of-week-weekday-composite-test
+  (testing ":day-of-week uses WEEKDAY and % operator; never EXTRACT(dayofweek) or MOD()"
+    (let [form (sql.qp/date :maxcompute :day-of-week (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          s (first (sql/format-expr form {:nested true}))]
+      (is (str/includes? s "WEEKDAY("))
+      (is (str/includes? s "%"))
+      (is (not (str/includes? (str/upper-case s) "MOD(")))
+      (is (not (str/includes? (str/upper-case s) "DAYOFWEEK"))))))
+
+(deftest ^:parallel week-of-year-iso-weekofyear-test
+  (testing ":week-of-year-iso via WEEKOFYEAR; never isoweek"
+    (let [form (sql.qp/date :maxcompute :week-of-year-iso (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}]))
+          s (first (sql/format-expr form {:nested true}))]
+      (is (str/includes? s "WEEKOFYEAR("))
+      (is (not (str/includes? (str/upper-case s) "ISOWEEK"))))))
+
+(deftest ^:parallel datetime-diff-native-datediff-test
+  (testing "datetime-diff renders native DATEDIFF; no ghost TIMESTAMP_DIFF/DATETIME_DIFF"
+    (let [diff (fn [u] (first (sql/format-expr
+                               (sql.qp/datetime-diff :maxcompute u
+                                                     (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])
+                                                     (sql.qp/->honeysql :maxcompute [:field "y" {::add/source-table "t" ::add/source-alias "y"}]))
+                               {:nested true})))
+          s-s (diff :second)
+          s-h (diff :hour)
+          s-m (diff :month)
+          s-w (diff :week)]
+      (is (str/includes? (str/upper-case s-s) "DATEDIFF("))
+      (is (str/includes? s-s "'ss'"))
+      (is (str/includes? s-h "'hh'"))
+      (is (str/includes? s-m "'mm'"))
+      (is (str/includes? (str/upper-case s-m) "CASE"))
+      (is (str/includes? (str/upper-case s-w) "/ 7"))
+      (is (not (str/includes? (str/upper-case s-s) "TIMESTAMP_DIFF")))
+      (is (not (str/includes? (str/upper-case s-m) "DATETIME_DIFF"))))))
+
+(deftest ^:parallel misc-fixed-shapes-test
+  (testing "float->DOUBLE, log base-first, YYYYMMDDHHMMSS->TO_DATE, ISO strip, GETDATE"
+    (let [f-str (first (sql/format-expr (sql.qp/->float :maxcompute (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))
+          l-str (first (sql/format-expr (sql.qp/->honeysql :maxcompute [:log [:field "x" {::add/source-table "t" ::add/source-alias "x"}]]) {:nested true}))
+          y-str (first (sql/format-expr (sql.qp/cast-temporal-string :maxcompute :Coercion/YYYYMMDDHHMMSSString->Temporal (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))
+          i-str (first (sql/format-expr (sql.qp/cast-temporal-string :maxcompute :Coercion/ISO8601->DateTime (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))
+          g-str (first (sql/format-expr (sql.qp/current-datetime-honeysql-form :maxcompute) {:nested true}))]
+      (is (str/includes? (str/upper-case f-str) "AS DOUBLE"))
+      (is (not (str/includes? (str/upper-case f-str) "FLOAT64")))
+      (is (str/includes? l-str "LOG(10"))
+      (is (str/includes? (str/upper-case y-str) "TO_DATE("))
+      (is (str/includes? y-str "yyyymmddhhmiss"))
+      (is (not (str/includes? (str/upper-case y-str) "PARSE_DATETIME")))
+      (is (str/includes? (str/upper-case i-str) "REPLACE("))
+      (is (str/includes? i-str "'T'"))
+      (is (str/includes? i-str "'Z'"))
+      (is (str/includes? (str/upper-case g-str) "GETDATE("))
+      (is (not (str/includes? (str/upper-case g-str) "CURRENT_TIMESTAMP"))))))

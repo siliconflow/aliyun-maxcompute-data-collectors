@@ -1333,7 +1333,7 @@
 
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->Date]
            [_driver _semantic_type expr]
-           (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " "")]
+           (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
                                     (h2x/literal "Z") (h2x/literal "")]))
 
 ;; 2026-09-08 review round-2 fix (engine probes P/Q-series, live df_cs_673150):

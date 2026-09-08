@@ -283,6 +283,16 @@
       (is (not (str/includes? (str/upper-case s-s) "TIMESTAMP_DIFF")))
       (is (not (str/includes? (str/upper-case s-m) "DATETIME_DIFF"))))))
 
+(deftest ^:parallel cast-temporal-string-generic-test
+  (testing "generic String->Temporal coercion uses SUBSTR(1,19) cast (engine Q4/P-series probes)"
+    (let [field-expr [:field "x" {::add/source-table "t" ::add/source-alias "x"}]
+          compiled (sql.qp/cast-temporal-string
+                     :maxcompute :Coercion/String->Temporal
+                     (sql.qp/->honeysql :maxcompute field-expr))
+          rendered (first (sql/format-expr compiled {:nested true}))]
+      (is (str/includes? (str/upper-case rendered) "SUBSTR("))
+      (is (str/includes? (str/upper-case rendered) "AS DATETIME")))))
+
 (deftest ^:parallel misc-fixed-shapes-test
   (testing "float->DOUBLE, log base-first, YYYYMMDDHHMMSS->TO_DATE, ISO strip, GETDATE"
     (let [f-str (first (sql/format-expr (sql.qp/->float :maxcompute (sql.qp/->honeysql :maxcompute [:field "x" {::add/source-table "t" ::add/source-alias "x"}])) {:nested true}))

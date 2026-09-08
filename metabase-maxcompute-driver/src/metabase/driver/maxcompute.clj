@@ -1333,6 +1333,18 @@
 
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->Date]
            [_driver _semantic_type expr]
-           (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
+           (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " "")]
                                     (h2x/literal "Z") (h2x/literal "")]))
+
+;; 2026-09-08 review round-2 fix (engine probes P/Q-series, live df_cs_673150):
+;; generic text→temporal casts on MaxCompute. CAST(str AS datetime|timestamp)
+;; accepts ONLY 'yyyy-mm-dd hh:mi:ss[.fff]'; it silently returns NULL for
+;; colon-milliseconds ('hh:mi:ss:fff') and ' +0800' offset suffixes — a raw
+;; CAST(col AS timestamp) against log-style columns ('2026-09-06
+;; 14:16:33:452 +0800') compiles yet yields all-NULL. Probe-verified safe
+;; universal form: SUBSTR to the canonical 19 chars then cast. Point-fraction
+;; ISO strings keep their precision via the more-specific methods above.
+(defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/String->Temporal]
+           [_driver _coercion-strategy expr]
+           (h2x/->datetime [:substr expr [:inline 1] [:inline 19]]))
 

@@ -650,21 +650,31 @@
                ((get-method ->temporal-type :default) target-type clause))
              target-type))
 
+;; 2026-09-08 engine-audit fix (read-only tests on live project df_cs_673150):
+;; MaxCompute does NOT accept 'minute'/'second' as DATETRUNC/DATEADD datepart
+;; tokens — only 'mi'/'ss' style short tokens, plus 'dd','hh','mm','yyyy',
+;; 'day','month','year','week'. The 3-arg (timezone) form of DATETRUNC is also
+;; invalid here (ODPS-0130121) — session tz comes from the connection settings.
+(def ^:private mbql-unit->datepart-token
+  "MBQL unit -> MaxCompute datepart token. NOTE: :quarter maps to 'quarter',
+  which is valid for DATEADD (engine-verified) but NOT for DATETRUNC — the
+  [:maxcompute :quarter] date method never routes through `trunc`, it builds
+  the month-shift composite instead."
+  {:second "ss" :minute "mi" :hour "hh" :day "dd"
+   :month "mm" :year "yyyy" :week "week" :quarter "quarter"})
+
 (defn- format-trunc
-       [_tag [expr unit report-timezone :as _args]]
-       (let [t               (or (temporal-type expr) :datetime)
-             f               (case t
-                                   :date      :datetrunc
-                                   :time      :datetrunc
-                                   :datetime  :datetrunc
-                                   :timestamp :datetrunc
-                                   :timestamp_ntz :datetrunc)
-             unit-expr       (h2x/literal (name unit))
-             expr            (if (and report-timezone
-                                      (= f :datetrunc))
-                               [f expr unit-expr (h2x/literal report-timezone)]
-                               [f expr unit-expr])]
-            (sql/format-expr expr {:nested true})))
+       [_tag [expr unit _report-timezone :as _args]]
+       ;; report-timezone arg ignored: MaxCompute DATETRUNC has no 3-arg form.
+       (let [t         (or (temporal-type expr) :datetime)
+             f         (case t
+                             :date      :datetrunc
+                             :time      :datetrunc
+                             :datetime  :datetrunc
+                             :timestamp :datetrunc
+                             :timestamp_ntz :datetrunc)
+             token     (get mbql-unit->datepart-token unit (name unit))]
+            (sql/format-expr [f expr (h2x/literal token)] {:nested true})))
 
 (sql/register-fn! ::trunc #'format-trunc)
 
@@ -688,15 +698,19 @@
 (def ^:private valid-time-extract-units
   #{:microsecond :millisecond :second :minute :hour})
 
+;; 2026-09-08 engine-audit fix: `EXTRACT(dayofweek FROM x)` etc. are parse
+;; errors on MaxCompute (invalid token 'FROM') — only a fixed spell set works
+;; (day/month/…). dayofweek/dayofyear/isoweek must be computed via composites.
+;; Also the 3-arg EXTRACT(x, tz) form is invalid on this engine.
+;; -> temp: keep `extract*` for the supported spell set only. The unsupported
+;; units are rerouted by the [:maxcompute …] `sql.qp/date` methods below.
 (defn- format-extract
-       [_tag [unit expr timezone]]
-       (let [[expr-sql & expr-args] (sql/format-expr expr {:nested true})
-             [zone-sql & zone-args] (when timezone
-                                          (sql/format-expr (h2x/literal timezone) {:nested true}))]
+       [_tag [unit expr _timezone]]
+       ;; timezone arg ignored: 3-arg EXTRACT is invalid on MaxCompute.
+       (let [[expr-sql & expr-args] (sql/format-expr expr {:nested true})]
             (into [((clojure.core/format "EXTRACT(%s FROM %s)" (name unit) expr-sql))]
                   cat
-                  [expr-args
-                   zone-args])))
+                  [expr-args])))
 
 (sql/register-fn! ::extract #'format-extract)
 
@@ -732,57 +746,73 @@
               ;; for datetimes or anything without a known temporal type, cast to timestamp and go from there
               (recur unit (->temporal-type :timestamp expr))))
 
+;; 2026-09-08 engine-audit fix: rewritten against engine-verified token set
+;; (live df_cs_673150). Changed units carry a note; unchanged ones were OK.
 (defmethod sql.qp/date [:maxcompute :second-of-minute] [_ _ expr] (extract :second    expr))
-(defmethod sql.qp/date [:maxcompute :minute]           [_ _ expr] (trunc   :minute    expr))
+(defmethod sql.qp/date [:maxcompute :minute]           [_ _ expr] (trunc   :minute    expr)) ; 'minute'->'mi' in format-trunc (was 0130071)
 (defmethod sql.qp/date [:maxcompute :minute-of-hour]   [_ _ expr] (extract :minute    expr))
-(defmethod sql.qp/date [:maxcompute :hour]             [_ _ expr] (trunc   :hour      expr))
+(defmethod sql.qp/date [:maxcompute :hour]             [_ _ expr] (trunc   :hour      expr)) ; 'hour' token OK
 (defmethod sql.qp/date [:maxcompute :hour-of-day]      [_ _ expr] (extract :hour      expr))
 (defmethod sql.qp/date [:maxcompute :day]              [_ _ expr] (trunc   :day       expr))
 (defmethod sql.qp/date [:maxcompute :day-of-month]     [_ _ expr] (extract :day       expr))
-(defmethod sql.qp/date [:maxcompute :day-of-year]      [_ _ expr] (extract :dayofyear expr))
+;; 'dayofyear' is not an EXTRACT spelling on MaxCompute (parse error) —
+;; engine-verified composite: DATEDIFF(x, year-trunc(x), 'dd') + 1.
+(defmethod sql.qp/date [:maxcompute :day-of-year]
+           [_driver _unit expr]
+           (h2x/+ [:datediff expr (trunc :year expr) (h2x/literal "dd")] [:inline 1]))
 (defmethod sql.qp/date [:maxcompute :month]            [_ _ expr] (trunc   :month     expr))
 (defmethod sql.qp/date [:maxcompute :month-of-year]    [_ _ expr] (extract :month     expr))
-(defmethod sql.qp/date [:maxcompute :quarter]          [_ _ expr] (trunc   :quarter   expr))
-(defmethod sql.qp/date [:maxcompute :quarter-of-year]  [_ _ expr] (extract :quarter   expr))
+;; 'quarter' is NOT a DATETRUNC token (0130071). Engine-verified composite:
+;; truncate to month, then back off (month-1) DIV 3 * 3 months (U3/U4 audit).
+(defmethod sql.qp/date [:maxcompute :quarter]
+           [_driver _unit expr]
+           [:dateadd
+            (trunc :month expr)
+            [:*-1 (h2x// (h2x/- (extract :month expr) [:inline 1]) [:inline 3]) [:inline 3]]
+            (h2x/literal "mm")])
+(defmethod sql.qp/date [:maxcompute :quarter-of-year]
+           [_driver _unit expr]
+           (h2x/cast :bigint (h2x// (h2x/+ (extract :month expr) [:inline 2]) [:inline 3])))
 (defmethod sql.qp/date [:maxcompute :year]             [_ _ expr] (trunc   :year      expr))
 (defmethod sql.qp/date [:maxcompute :year-of-era]      [_ _ expr] (extract :year      expr))
 
-(defn- format-mod
-       "MaxCompute mod is a function like mod(x, y) rather than an operator like x mod y."
-       [_tag [x y :as _args]]
-       (let [[x-sql & x-args] (sql/format-expr x {:nested true})
-             [y-sql & y-args] (sql/format-expr y {:nested true})]
-            (into [(format "mod(%s, %s)" x-sql y-sql)]
-                  cat
-                  [x-args y-args])))
+;; 2026-09-08 engine-audit fix: there is NO `mod(x,y)` function on MaxCompute
+;; (ODPS-0130071) — the `%` operator is the only remaining form (A9/A10 audit).
+;; The day-of-week method below switched from the (removed) ::mod clause to
+;; h2x/mod, which renders the `%` operator.
 
-(sql/register-fn! ::mod #'format-mod)
-
+;; 2026-09-08 engine-audit fix: `EXTRACT(dayofweek FROM x)` is a parse error on
+;; MaxCompute, and `DATEPART(x, 'dayofweek')` is 0130071. Engine-verified order:
+;; WEEKDAY(x) = Mon=0..Sun=6, so ((WEEKDAY(x)+1) % 7) + 1 gives Sun=1..Sat=7
+;; before the start-of-week adjustment (T6/V7 audit).
 (defmethod sql.qp/date [:maxcompute :day-of-week]
            [driver _ expr]
            (sql.qp/adjust-day-of-week
              driver
-             (extract :dayofweek expr)
+             (h2x/+ (h2x/mod (h2x/+ [:weekday expr] [:inline 1]) [:inline 7]) [:inline 1])
              (driver.common/start-of-week-offset driver)
-             (fn [x y]
-                 [::mod x y])))
+             h2x/mod))
 
 (defmethod sql.qp/date [:maxcompute :week]
            [_driver _unit expr]
-           (trunc (keyword (format "week(%s)" (name (setting/get-value-of-type :keyword :start-of-week)))) expr))
+           (trunc :week expr)) ; native 'week' trunc = Monday-start; driver/adjust-start-of-week handles instance-tz-start shifts upstream
+;; NOTE 2026-09-08: 'week(monday)'/'week(sunday)' DATETRUNC spellings and the
+;; O4 shift-composite were engine-verified too; plain 'week' is the shortest
+;; correct form for a Monday-start week. When Metabase's start-of-week setting
+;; is Sunday, adjust-start-of-week in the parent path applies the day shift.
 
-;; TODO: maxcompute supports week(weekday), maybe we don't have to do the complicated math for maxcompute?
+;; 'isoweek' is not an EXTRACT spelling on MaxCompute (parse error) and
+;; DATEPART 'isoweek' returns 0 (wrong) — WEEKOFYEAR matches ISO week on all
+;; probed edge dates (J audit: 2027-01-01→53, 2026-12-28→53, 2026-01-01→1).
 (defmethod sql.qp/date [:maxcompute :week-of-year-iso]
            [_driver _unit expr]
-           (extract :isoweek expr))
+           [:weekofyear expr])
 
-;; 2026-09-07 fix: previous impl emitted `TIMESTAMP_MILLIS(x)` / `TIMESTAMP_SECONDS(x)`
-;; / `TIMESTAMP_MICROS(x)` built-ins — these DO NOT exist in MaxCompute (ODPS-0130071
-;; whether or not odps.sql.bigquery.compatible is set; verified against the live
-;; df_cs_673150 engine). Worse, the :sql default for :milliseconds fell through (as
-;; in the visible-query-builder bug) to `FROM_UNIXTIME(x / 1000.0)`: `/` on integer
-;; operands returns DOUBLE in MaxCompute, and FROM_UNIXTIME only takes BIGINT, so
-;; compilation fails with ODPS-0130121.
+;; 2026-09-07/08 unix-timestamp fix (engine-verified, see PR #2 + skill notes):
+;; previous impl emitted nonexistent `TIMESTAMP_MILLIS/SECONDS/MICROS(x)` built-ins
+;; (ODPS-0130071 live), and the :sql :milliseconds default leaked
+;; `FROM_UNIXTIME(x / 1000.0)` into generated SQL: `/` on integers returns DOUBLE
+;; and FROM_UNIXTIME only takes BIGINT → ODPS-0130121 (the visible-query-builder bug).
 ;;
 ;; Engine-verified replacements (all read-only tested 2026-09-07):
 ;;   :seconds      → CAST(FROM_UNIXTIME(CAST(x AS BIGINT)) AS TIMESTAMP)   — exact
@@ -821,22 +851,28 @@
                       (h2x/with-database-type-info "timestamp")
                       (with-temporal-type :timestamp))))
 
+;; 2026-09-08 engine-audit fix: `DATETIME(x, tz)` does NOT exist on MaxCompute
+;; (ODPS-0130071, E9 audit). Engine-verified path: TIMESTAMP(x, tz) works
+;; (E8), CAST(TIMESTAMP(x, 'UTC') AS datetime) shifts the wall clock (S1):
+;; from 12:34 → 20:34 with Asia/Shanghai target.
 (defmethod sql.qp/->honeysql [:maxcompute :convert-timezone]
            [driver [_ arg target-timezone source-timezone]]
-           (let [datetime     (fn [x target-timezone]
-                                  [:datetime x target-timezone])
-                 hsql-form    (sql.qp/->honeysql driver arg)
+           (let [hsql-form    (sql.qp/->honeysql driver arg)
                  timestamptz? (h2x/is-of-type? hsql-form "timestamp")]
                 (sql.u/validate-convert-timezone-args timestamptz? target-timezone source-timezone)
-                (-> (if timestamptz?
-                      hsql-form
-                      [:timestamp hsql-form (or source-timezone (qp.timezone/results-timezone-id))])
-                    (datetime target-timezone)
-                    (with-temporal-type :datetime))))
+                (as-> (if timestamptz?
+                        hsql-form
+                        [:timestamp hsql-form (h2x/literal (or source-timezone (qp.timezone/results-timezone-id)))]) form
+                    [:cast
+                     [:timestamp form (h2x/literal target-timezone)]
+                     :datetime]
+                    (with-temporal-type form :datetime))))
 
+;; 2026-09-08 engine-audit fix: MaxCompute has no `float64` type (ODPS-0130071, E1
+;; audit); DOUBLE is the native spelling (E2).
 (defmethod sql.qp/->float :maxcompute
            [_ value]
-           (h2x/cast :float64 value))
+           (h2x/cast :double value))
 
 (defmethod sql.qp/->honeysql [:maxcompute :regex-match-first]
            [driver [_ arg pattern]]
@@ -917,9 +953,12 @@
               (>= (count components) 2))
          true))
 
+;; 2026-09-08 engine-audit fix: PARSE_DATETIME does not exist on MaxCompute
+;; (ODPS-0130071). Engine-verified native form (E4 audit):
+;; TO_DATE(x, 'yyyymmddhhmiss').
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/YYYYMMDDHHMMSSString->Temporal]
            [_driver _coercion-strategy expr]
-           [:parse_datetime (h2x/literal "%Y%m%d%H%M%S") expr])
+           [:to_date expr (h2x/literal "yyyymmddhhmiss")])
 
 (defmethod sql.qp/->honeysql [:maxcompute ::h2x/identifier]
            [_driver identifier]
@@ -993,48 +1032,6 @@
                 (datetime-diff-check-args x y)
                 (sql.qp/datetime-diff driver unit x y)))
 
-(defn- timestamp-diff [unit x y]
-       [:timestamp_diff
-        (->temporal-type :timestamp y)
-        (->temporal-type :timestamp x)
-        [:raw (name unit)]])
-
-(defmethod sql.qp/datetime-diff [:maxcompute :year]
-           [driver _unit x y]
-           (h2x// (sql.qp/datetime-diff driver :month x y) 12))
-
-(defmethod sql.qp/datetime-diff [:maxcompute :quarter]
-           [driver _unit x y]
-           (h2x// (sql.qp/datetime-diff driver :month x y) 3))
-
-(defmethod sql.qp/datetime-diff [:maxcompute :month]
-           [_driver _unit x y]
-           ;; Only maxcompute's `datetime_diff` supports months. We need to convert args to datetime to use it.
-           ;; Also `<` and `>` comparisons can only be made on the same type.
-           (let [x' (->temporal-type :datetime x)
-                 y' (->temporal-type :datetime y)]
-                (h2x/+ [:datetime_diff y' x' [:raw "month"]]
-                       ;; datetime_diff counts month boundaries not whole months, so we need to adjust
-                       ;; if x<y but x>y in the month calendar then subtract one month
-                       ;; if x>y but x<y in the month calendar then add one month
-                       [:case
-                        [:and [:< x' y'] [:> (extract :day x) (extract :day y)]]
-                        -1
-                        [:and [:> x' y'] [:< (extract :day x) (extract :day y)]]
-                        1
-                        :else 0])))
-
-(defmethod sql.qp/datetime-diff [:maxcompute :week]
-           [driver _unit x y]
-           (h2x// (sql.qp/datetime-diff driver :day x y) 7))
-
-(defmethod sql.qp/datetime-diff [:maxcompute :day]
-           [_driver _unit x y]
-           (timestamp-diff :day (trunc :day x) (trunc :day y)))
-
-(defmethod sql.qp/datetime-diff [:maxcompute :hour] [_driver _unit x y] (timestamp-diff :hour x y))
-(defmethod sql.qp/datetime-diff [:maxcompute :minute] [_driver _unit x y] (timestamp-diff :minute x y))
-(defmethod sql.qp/datetime-diff [:maxcompute :second] [_driver _unit x y] (timestamp-diff :second x y))
 
 (defmethod driver/escape-alias :maxcompute
            [driver s]
@@ -1174,6 +1171,42 @@
            (-> (sql.qp/compiled (->temporal-type target-type form))
                (vary-meta assoc :maxcompute/temporal-type target-type)))
 
+;; ===================================================================
+;; 2026-09-08 engine-audit fixes — datetime-diff family (Z/AA audit):
+;; TIMESTAMP_DIFF / DATETIME_DIFF built-ins DO NOT exist on MaxCompute
+;; (ODPS-0130071). DATEDIFF(x, y, token) is the engine-verified native
+;; form (accepts DATETIME or TIMESTAMP args, AA1 audit) with short tokens
+;; 'dd','hh','mi','ss','mm','yyyy'. Month semantics: calendar-month
+;; boundaries; whole months = subtract 1 when day(x) < day(y) AND x>=y
+;; (Z1: 22→21; Z-negative dir unchanged: -22 for x<y dir, Z5/Z6 audit).
+(defmethod sql.qp/datetime-diff [:maxcompute :year]
+           [driver _unit x y]
+           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :month x y) [:inline 12])))
+(defmethod sql.qp/datetime-diff [:maxcompute :quarter]
+           [driver _unit x y]
+           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :month x y) [:inline 3])))
+(defmethod sql.qp/datetime-diff [:maxcompute :month]
+           [_driver _unit x y]
+           (h2x/- [:datediff x y (h2x/literal "mm")]
+                  [:case
+                   [:< (extract :day x) (extract :day y)] [:inline 1]
+                   :else [:inline 0]]))
+(defmethod sql.qp/datetime-diff [:maxcompute :week]
+           [driver _unit x y]
+           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :day x y) [:inline 7])))
+(defmethod sql.qp/datetime-diff [:maxcompute :day]
+           [_driver _unit x y]
+           [:datediff (trunc :day x) (trunc :day y) (h2x/literal "dd")])
+(defmethod sql.qp/datetime-diff [:maxcompute :hour]
+           [_driver _unit x y]
+           [:datediff x y (h2x/literal "hh")])
+(defmethod sql.qp/datetime-diff [:maxcompute :minute]
+           [_driver _unit x y]
+           [:datediff x y (h2x/literal "mi")])
+(defmethod sql.qp/datetime-diff [:maxcompute :second]
+           [_driver _unit x y]
+           [:datediff x y (h2x/literal "ss")])
+
 ;(defn- reconcile-temporal-types
 ;       "Make sure the temporal types of fields and values in filter clauses line up."
 ;       [[tag & args :as clause]]
@@ -1299,20 +1332,22 @@
                                        sql.qp/source-query-alias)
                        :mbql?      true)))
 
+;; 2026-09-08 engine-audit fix: CURRENT_TIMESTAMP does not exist on MaxCompute
+;; (ODPS-0130071, K4 audit). GETDATE() is the native current moment (DATETIME
+;; with millisecond precision, K1) and CAST(GETDATE() AS timestamp|date|datetime)
+;; are all valid (T3 audit).
 (defn- format-current-moment
-       [_tag [target-type report-timezone :as _args]]
-       (let [f           (case (or target-type :timestamp)
-                               :time      :current_timestamp
-                               :date      :current_timestamp
-                               :datetime  :current_timestamp
-                               :timestamp_ntz :current_timestamp
-                               :timestamp :current_timestamp)
-             is-timestamp (when (not= target-type :timestamp) true)]
-            (sql/format-expr
-              (if is-timestamp
-                [:cast [f] target-type]
-                [:cast [f] target-type])
-              {:nested true})))
+       [_tag [target-type _report-timezone :as _args]]
+       (sql/format-expr
+         [:cast
+          [:getdate]
+          [:raw (case (or target-type :timestamp)
+                  :time      "datetime"
+                  :date      "date"
+                  :datetime  "datetime"
+                  :timestamp_ntz "datetime"
+                  "timestamp")]]
+         {:nested true}))
 
 (sql/register-fn! ::current-moment #'format-current-moment)
 
@@ -1333,10 +1368,13 @@
            (->> (sql.qp/current-datetime-honeysql-form driver)
                 (->temporal-type :timestamp)))
 
-;; In MaxCompute, log syntax is `log(x, base)`
+;; 2026-09-08 engine-audit fix: MaxCompute LOG(base, value) — LOG(100,10)=0.5
+;; means LOG(a,b) = log_a(b), i.e. the FIRST arg is the base (T1 audit). The
+;; old form [:log field [:inline 10]] computed log_field(10), the exact
+;; inverse of log10(field). Correct: [:log [:inline 10] field].
 (defmethod sql.qp/->honeysql [:maxcompute :log]
            [driver [_ field]]
-           [:log (sql.qp/->honeysql driver field) [:inline 10]])
+           [:log [:inline 10] (sql.qp/->honeysql driver field)])
 
 (defmethod sql.qp/quote-style :maxcompute
            [_driver]
@@ -1376,15 +1414,18 @@
                                                                                                     arg))
                                                                                               args)))))))
 
+;; 2026-09-08 engine-audit fix: CAST('2024-01-15T12:30:45Z' AS datetime|date)
+;; compiles but silently returns NULL for ISO-8601 input on MaxCompute (E5/R1
+;; audit). Engine-verified shape strips 'T'/'Z' first (E6/AC3; fractional
+;; seconds survive into TIMESTAMP, AC4). For the Time target there is no TIME
+;; type on MaxCompute (L1 audit) — leave the generic cast.
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->DateTime]
            [_driver _semantic_type expr]
-           (h2x/->datetime expr))
+           (h2x/->datetime [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
+                                         (h2x/literal "Z") (h2x/literal "")]))
 
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->Date]
            [_driver _semantic_type expr]
-           (h2x/->date expr))
-
-(defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->Time]
-           [_driver _semantic_type expr]
-           (h2x/->time expr))
+           (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
+                                    (h2x/literal "Z") (h2x/literal "")]))
 

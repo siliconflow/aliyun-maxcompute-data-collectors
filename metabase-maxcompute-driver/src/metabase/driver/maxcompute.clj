@@ -362,14 +362,6 @@
                   (catch Throwable e
                     (.close stmt)
                     (throw e)))))
-(defmethod sql.qp/->honeysql [:maxcompute :datetime-diff]
-           [driver [_ x y unit]]
-           (let [x (sql.qp/->honeysql driver x)
-                 y (sql.qp/->honeysql driver y)]
-                (:raw (if (nil? unit)
-                        (str "DATEDIFF(" x ", " y ")")
-                        (str "DATEDIFF(" x ", " y ", '-" unit "')")))))
-
 (defn ^:private project-id-for-current-query
       []
       (when (qp.store/initialized?)
@@ -802,13 +794,16 @@
              (driver.common/start-of-week-offset driver)
              h2x/mod))
 
+;; 2026-09-08 review fix: :week now honours the instance's start-of-week
+;; setting. Native DATETRUNC 'week' is always Monday-based (G/O audits), and
+;; engine-verified 'week(sunday)' / the O4 shift-composite exist for the
+;; Sunday-start case ('week(sunday)' audit O3). Using the setting-aware
+;; spelling keeps bucket edges aligned when the admin changes start-of-week.
 (defmethod sql.qp/date [:maxcompute :week]
            [_driver _unit expr]
-           (trunc :week expr)) ; native 'week' trunc = Monday-start; driver/adjust-start-of-week handles instance-tz-start shifts upstream
-;; NOTE 2026-09-08: 'week(monday)'/'week(sunday)' DATETRUNC spellings and the
-;; O4 shift-composite were engine-verified too; plain 'week' is the shortest
-;; correct form for a Monday-start week. When Metabase's start-of-week setting
-;; is Sunday, adjust-start-of-week in the parent path applies the day shift.
+           (trunc (keyword (format "week(%s)"
+                                   (name (driver/db-start-of-week :maxcompute))))
+                  expr))
 
 ;; 'isoweek' is not an EXTRACT spelling on MaxCompute (parse error) and
 ;; DATEPART 'isoweek' returns 0 (wrong) — WEEKOFYEAR matches ISO week on all

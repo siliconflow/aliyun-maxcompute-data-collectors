@@ -241,6 +241,15 @@
 ;; this convert "a"."b"."c" to `a`.`b`.`c`, which is necessary for maxcompute
 (defmethod sql.qp/quote-style :maxcompute [_] :mysql)
 
+;; 2026-09-08 engine-audit fix: db-start-of-week was never defined for
+;; :maxcompute — grouping by Week in the visual query builder threw
+;; IllegalArgumentException (No method in multimethod 'db-start-of-week').
+;; MaxCompute DATETRUNC 'week' is Monday-based (G/O audits), matching
+;; Metabase's default :monday start of week.
+(defmethod driver/db-start-of-week :maxcompute
+  [_]
+  :monday)
+
 (defmethod sql-jdbc.conn/connection-details->spec :maxcompute
            [driver details-map]
            (let [{:keys [project endpoint ak sk timezone settings quotaName namespace-schema]} details-map
@@ -768,11 +777,11 @@
            [_driver _unit expr]
            [:dateadd
             (trunc :month expr)
-            [:*-1 (h2x// (h2x/- (extract :month expr) [:inline 1]) [:inline 3]) [:inline 3]]
+            [:*-1 (h2x// (h2x/- [:datepart expr (h2x/literal "mm")] [:inline 1]) [:inline 3]) [:inline 3]]
             (h2x/literal "mm")])
 (defmethod sql.qp/date [:maxcompute :quarter-of-year]
            [_driver _unit expr]
-           (h2x/cast :bigint (h2x// (h2x/+ (extract :month expr) [:inline 2]) [:inline 3])))
+           (h2x/cast :bigint (h2x// (h2x/+ [:datepart expr (h2x/literal "mm")] [:inline 2]) [:inline 3])))
 (defmethod sql.qp/date [:maxcompute :year]             [_ _ expr] (trunc   :year      expr))
 (defmethod sql.qp/date [:maxcompute :year-of-era]      [_ _ expr] (extract :year      expr))
 
@@ -1189,7 +1198,7 @@
            [_driver _unit x y]
            (h2x/- [:datediff x y (h2x/literal "mm")]
                   [:case
-                   [:< (extract :day x) (extract :day y)] [:inline 1]
+                   [:< [:datepart x (h2x/literal "dd")] [:datepart y (h2x/literal "dd")]] [:inline 1]
                    :else [:inline 0]]))
 (defmethod sql.qp/datetime-diff [:maxcompute :week]
            [driver _unit x y]

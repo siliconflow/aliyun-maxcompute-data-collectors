@@ -51,7 +51,7 @@
        (qp.compile/compile
          {:database 1
           :type     :query
-          :query    {:fields [[:field 1001 nil] [:field 1002 nil]]}}))))
+          :query    {:fields [[:field 1001 nil] [:field 1002 nil]]}})))))
 
 (deftest integration-table-browse-sql-test
   (testing "table-browse MBQL query compiles to well-formed SQL: every field renders an expression, FROM is two-part"

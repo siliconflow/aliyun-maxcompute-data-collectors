@@ -13,6 +13,9 @@
    [metabase.driver.maxcompute :as maxcompute]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.util.unprepare :as unprepare]
+   [metabase.query-processor.compile :as qp.compile]
+   [metabase.lib.core :as lib]
+   [metabase.lib.test-util :as lib.tu]
    [metabase.lib.test-metadata :as lib.test-md]
    [metabase.query-processor.store :as qp.store]
    [metabase.query-processor.util.add-alias-info :as add]
@@ -24,22 +27,54 @@
   (testing "The maxcompute namespace loads without throwing (validates ns declaration, requires, register!)"
     (is (some? (find-ns 'metabase.driver.maxcompute)))))
 
+;; 2026-09-08 production incident (bi.siliconflow.cn v0.63.16.6 + driver v0.0.6):
+;; table browse / simple data select rendered SQL with EMPTY select expressions
+;; (…SELECT AS `_key_`…) and a one-blob FROM `project.db.table`. Guard the full
+;; pipeline (field refs -> add-alias-info -> top-level clauses -> rendered SQL)
+;; — unit-level HoneySQL shape tests missed this entirely.
+(defn- compile-simple-table-query
+  "Compiles an MBQL query (table browse shape: plain fields, no aggregation) to native
+   SQL with a mock metadata provider whose Database details carry :project, mirroring
+   the production incident (queryHash e0bfeb…). Returns the rendered SQL string."
+  [db-details]
+  (qp.store/with-metadata-provider
+    (lib.tu/mock-metadata-provider
+      {:database {:lib/type :metadata/database, :id 1 :name "test-mc" :engine :maxcompute
+                  :details db-details}
+       :tables   [{:lib/type :metadata/table, :id 100 :name "inference_detail_inputs" :schema "df_cs"}]
+       :fields   [{:lib/type :metadata/column, :id 1001 :name "_key_"      :table-id 100 :base-type :type/Text}
+                  {:lib/type :metadata/column, :id 1002 :name "_timestamp_" :table-id 100
+                   :base-type :type/BigInteger :effective-type :type/DateTime
+                   :coercion-strategy :Coercion/UNIXMilliseconds->DateTime}]})
+    (driver/with-driver :maxcompute
+      (:query
+       (qp.compile/compile
+         {:database 1
+          :type     :query
+          :query    {:source-table 100
+                   :fields      [[:field 1001 nil] [:field 1002 nil]]}})))))
+
+(deftest integration-table-browse-sql-test
+  (testing "table-browse MBQL query compiles to well-formed SQL: every field renders an expression, FROM is two-part"
+    (let [sql (compile-simple-table-query {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"})]
+      (testing "no empty SELECT expressions (the incident's `SELECT AS `_key_``)"
+        (is (str/includes? sql "_key_"))
+        (is (not (re-matches #"(?s).*SELECT +(AS|,).*" sql)) "select list must not be empty"))
+      (testing "FROM identifier must not be a single-blob `project.db.table`"
+        (is (not (str/includes? sql "`df_cs_673150.df_cs_673150.inference_detail_inputs`")))))))
+
 (deftest ^:parallel driver-registered-test
   (testing ":maxcompute is registered with :sql-jdbc parent (derives from :sql as well)"
     ;; `isa?` against driver/hierarchy is the structural check; `driver/initialized?` is a runtime
     ;; state check that requires `driver/initialize!` to have run, which doesn't happen in unit tests.
-    ;; The driver auto-detects whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x has it;
-    ;; master removed it in PR #77529). When present, the driver registers with :sql-mbql5 as an
-    ;; additional parent; when absent, :sql-jdbc alone suffices.
+    ;; 2026-09-08 incident fix: the driver must NOT derive from :sql-mbql5 —
+    ;; its clause-order forwarding shims corrupt legacy 3-tuple :field clauses
+    ;; on v0.63.x (identifiers render with empty components; the bi.siliconflow.cn
+    ;; production breakage). See register comment in maxcompute.clj.
     (is (isa? driver/hierarchy :maxcompute :sql-jdbc))
     (is (isa? driver/hierarchy :maxcompute :sql))
-    (let [mbql5-present? (try
-                           (require 'metabase.driver.sql-mbql5)
-                           true
-                           (catch Throwable _ false))]
-      (is (= mbql5-present?
-             (isa? driver/hierarchy :maxcompute :sql-mbql5))
-          ":sql-mbql5 derivation should match namespace availability"))))
+    (is (not (isa? driver/hierarchy :maxcompute :sql-mbql5))
+        ":maxcompute must not derive from :sql-mbql5 (legacy-field reorder bug)")))
 
 (deftest ^:parallel escape-alias-test
   (testing "escape-alias converts aliases to valid MaxCompute identifiers"
@@ -247,6 +282,16 @@
       (is (str/includes? (str/upper-case s-w) "/ 7"))
       (is (not (str/includes? (str/upper-case s-s) "TIMESTAMP_DIFF")))
       (is (not (str/includes? (str/upper-case s-m) "DATETIME_DIFF"))))))
+
+(deftest ^:parallel cast-temporal-string-generic-test
+  (testing "generic String->Temporal coercion uses SUBSTR(1,19) cast (engine Q4/P-series probes)"
+    (let [field-expr [:field "x" {::add/source-table "t" ::add/source-alias "x"}]
+          compiled (sql.qp/cast-temporal-string
+                     :maxcompute :Coercion/String->Temporal
+                     (sql.qp/->honeysql :maxcompute field-expr))
+          rendered (first (sql/format-expr compiled {:nested true}))]
+      (is (str/includes? (str/upper-case rendered) "SUBSTR("))
+      (is (str/includes? (str/upper-case rendered) "AS DATETIME")))))
 
 (deftest ^:parallel misc-fixed-shapes-test
   (testing "float->DOUBLE, log base-first, YYYYMMDDHHMMSS->TO_DATE, ISO strip, GETDATE"

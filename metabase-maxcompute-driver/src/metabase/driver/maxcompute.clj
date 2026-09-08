@@ -41,18 +41,16 @@
 
 (set! *warn-on-reflection* true)
 
-;; Auto-detect whether `metabase.driver.sql-mbql5` exists (Metabase <= v0.63.x
-;; has it; master removed it in PR #77529, with :sql directly using MBQL5
-;; compilation). Register with :sql-mbql5 parent when available so the driver
-;; opts into MBQL5 compilation on older Metabase; on master, :sql-jdbc alone
-;; suffices since :sql now uses MBQL5 directly.
-(let [mbql5-available? (try
-                         (require '[metabase.driver.sql-mbql5])
-                         true
-                         (catch Throwable _ false))]
-  (driver/register! :maxcompute, :parent (if mbql5-available?
-                                           #{:sql-jdbc :sql-mbql5}
-                                           :sql-jdbc)))
+;; 2026-09-08 production-incident lesson: do NOT register :sql-mbql5 as a
+;; parent. On v0.63.x, [:sql-mbql5 :field]'s forwarding shims REORDER legacy
+;; three-tuple clauses ([:field id-or-name opts]) into MBQL5 order before
+;; [:sql :field] destructures them with the legacy order — the alias info
+;; lands on the wrong slots and identifiers come out with EMPTY components
+;; ([:identifier :field []]), which renders as `SELECT AS `_x_`` / one-blob
+;; FROM in production (queryHash e0bfeb…, bi.siliconflow.cn). The official
+;; OSS driver 0.1.0 registers :sql-jdbc only and does not hit this; v0.0.6
+;; did, because it opted into :sql-mbql5. Register like the official driver.
+(driver/register! :maxcompute, :parent :sql-jdbc)
 (doseq [[feature supported?] {;; Does this database support following foreign key relationships while querying?
                               ;; Note that this is different from supporting primary key and foreign key constraints in the schema; see below.
                               :foreign-keys                           false
@@ -241,6 +239,21 @@
 ;; this convert "a"."b"."c" to `a`.`b`.`c`, which is necessary for maxcompute
 (defmethod sql.qp/quote-style :maxcompute [_] :mysql)
 
+
+;; 2026-09-08 production incident fix (bi.siliconflow.cn, v0.63.16.6 + driver
+;; v0.0.6): the legacy fork shipped TWO defmethods for
+;; `[:maxcompute ::h2x/identifier]` plus a `[:maxcompute :field]` wrapper
+;; whose "MBQL5 clause order detection" (require 'metabase.driver.sql-mbql5)
+;; matched on v0.63.x, reading opts at the wrong index for legacy-ordered
+;; clauses. Result: `[:identifier :field []]` — empty components — which
+;; malli rejects in dev (CI) and, with instrumentation off in production,
+;; silently renders as EMPTY select expressions (`SELECT AS `_key_``) and a
+;; one-blob FROM `project.db.table`. Both are engine errors
+;; (ODPS-0130071: column `as` cannot be resolved).
+;; All three are deleted: ::h2x/identifier now falls through to the
+;; [:sql ::h2x/identifier] identity default, and :field clauses compile
+;; through [:sql :field] directly — the same path the official OSS driver
+;; 0.1.0 exercises in production today.
 ;; 2026-09-08 engine-audit fix: db-start-of-week was never defined for
 ;; :maxcompute — grouping by Week in the visual query builder threw
 ;; IllegalArgumentException (No method in multimethod 'db-start-of-week').
@@ -362,41 +375,6 @@
                   (catch Throwable e
                     (.close stmt)
                     (throw e)))))
-(defn ^:private project-id-for-current-query
-      []
-      (when (qp.store/initialized?)
-            (when-let [{:keys [details]} (lib.metadata/database (qp.store/metadata-provider))]
-                      (:project details))))
-
-(defn should-qualify-identifier? [_] true)                  ;
-
-
-(defmethod sql.qp/->honeysql [:maxcompute ::h2x/identifier]
-           [_driver identifier]
-           (letfn [(prefix-components [[dataset-id table & more :as _components]]
-                                      (cons (str (when-let [proj-id (project-id-for-current-query)]
-                                                           (str proj-id \.))
-                                                 dataset-id
-                                                 \.
-                                                 table)
-                                            more))
-
-                   (update-identifier-prefix-components [[_tag identifier-type components]]
-                                                        (apply h2x/identifier identifier-type (prefix-components components)))]
-
-                  (cond-> identifier
-                          (should-qualify-identifier? identifier) update-identifier-prefix-components
-                          true (vary-meta assoc ::do-not-qualify? true))))
-
-(defn- valid-project-identifier?
-       "Is String `s` a valid MaxCompute project identifier (a.k.a. project-id)? Identifiers are only allowed to contain
-       letters, numbers, and underscores, cannot start with a number, and for project-id, can be at most 30 characters long."
-       [s]
-       (boolean (or (nil? s)
-                    (and (string? s)
-                         (re-matches #"^[a-zA-Z_0-9\.\-]{1,30}$" s)))))
-
-
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                       Running Queries & Parsing Results                                        |
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -927,87 +905,12 @@
 ;;; |                                                Query Processor                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; this is a little hacky, I'm 99% sure we could just have the [[sql.qp/->honeysql]] method for `:field` swap out the
-;; `::add/source-table` to a `[project.dataset table]` pair but this will have to do for now.
-(def ^:private ^:dynamic *field-is-from-join-or-source-query?* false)
-
-(defn- should-qualify-identifier?
-       "Should we qualify an [[h2x/identifier]] with the dataset name?
-
-       Table & Field identifiers (usually) need to be qualified with the current dataset name; this needs to be part of the
-       table e.g.
-
-         `table`.`field` -> `dataset.table`.`field`"
-       [[_tag identifier-type components, :as identifier]]
-       (cond
-         (::do-not-qualify? (meta identifier))
-         false
-
-         ;; If we're currently using a Table alias, don't qualify the alias with the dataset name
-         *field-is-from-join-or-source-query?*
-         false
-
-         ;; otherwise always qualify Table identifiers
-         (= identifier-type :table)
-         true
-
-         ;; Only qualify Field identifiers that are qualified by a Table. (e.g. don't qualify stuff inside `CREATE TABLE`
-         ;; DDL statements)
-         (and (= identifier-type :field)
-              (>= (count components) 2))
-         true))
-
 ;; 2026-09-08 engine-audit fix: PARSE_DATETIME does not exist on MaxCompute
 ;; (ODPS-0130071). Engine-verified native form (E4 audit):
 ;; TO_DATE(x, 'yyyymmddhhmiss').
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/YYYYMMDDHHMMSSString->Temporal]
            [_driver _coercion-strategy expr]
            [:to_date expr (h2x/literal "yyyymmddhhmiss")])
-
-(defmethod sql.qp/->honeysql [:maxcompute ::h2x/identifier]
-           [_driver identifier]
-           (letfn [(prefix-components [[dataset-id table & more :as _components]]
-                                      (cons (str (when-let [proj-id (project-id-for-current-query)]
-                                                           (str proj-id \.))
-                                                 dataset-id
-                                                 \.
-                                                 table)
-                                            more))
-                   (update-identifier-prefix-components [[_tag identifier-type components]]
-                                                        (apply h2x/identifier identifier-type (prefix-components components)))]
-                  (cond-> identifier
-                          (should-qualify-identifier? identifier) update-identifier-prefix-components
-                          true                                    (vary-meta assoc ::do-not-qualify? true))))
-
-(defmethod sql.qp/->honeysql [:maxcompute :field]
-           [driver field-clause]
-           ;; :field clause order differs between Metabase versions:
-           ;;   - master (PR #77529+):  [:field opts id-or-name]
-           ;;   - v0.63.x and earlier:  [:field id-or-name opts]
-           ;; The parent method [:sql :field] destructures according to its own version's order, so
-           ;; we pass `field-clause` through unchanged. We only need to extract `source-table` from
-           ;; `opts` here for the join/source-query binding below.
-           (let [mbql5?        (try
-                                 (require '[metabase.driver.sql-mbql5])
-                                 true
-                                 (catch Throwable _ false))
-                 opts          (if mbql5?
-                                 ;; v0.63.x: [:field id-or-name opts] — opts at index 2
-                                 (nth field-clause 2)
-                                 ;; master:  [:field opts id-or-name] — opts at index 1
-                                 (nth field-clause 1))
-                 source-table  (::add/source-table opts)
-                 parent-method (get-method sql.qp/->honeysql [:sql :field])]
-                ;; if the Field is from a join or source table, record this fact so that we know never to qualify it with the
-                ;; project ID no matter what
-                (binding [*field-is-from-join-or-source-query?* (not (integer? source-table))]
-                         ;; attach temporal type info to the field clause, this will get attached to the resulting [[h2x/identifier]] by
-                         ;; SQL QP parent method, and we can access that inside other things like [[sql.qp/date]] implementations which it
-                         ;; may call in turn.
-                         (let [field-clause (with-temporal-type field-clause (temporal-type field-clause))
-                               result       (parent-method driver field-clause)]
-                              (cond-> result
-                                      (not (temporal-type result)) (with-temporal-type (temporal-type field-clause)))))))
 
 (defmethod sql.qp/->honeysql [:maxcompute :relative-datetime]
            [driver clause]
@@ -1432,4 +1335,16 @@
            [_driver _semantic_type expr]
            (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
                                     (h2x/literal "Z") (h2x/literal "")]))
+
+;; 2026-09-08 review round-2 fix (engine probes P/Q-series, live df_cs_673150):
+;; generic text→temporal casts on MaxCompute. CAST(str AS datetime|timestamp)
+;; accepts ONLY 'yyyy-mm-dd hh:mi:ss[.fff]'; it silently returns NULL for
+;; colon-milliseconds ('hh:mi:ss:fff') and ' +0800' offset suffixes — a raw
+;; CAST(col AS timestamp) against log-style columns ('2026-09-06
+;; 14:16:33:452 +0800') compiles yet yields all-NULL. Probe-verified safe
+;; universal form: SUBSTR to the canonical 19 chars then cast. Point-fraction
+;; ISO strings keep their precision via the more-specific methods above.
+(defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/String->Temporal]
+           [_driver _coercion-strategy expr]
+           (h2x/->datetime [:substr expr [:inline 1] [:inline 19]]))
 

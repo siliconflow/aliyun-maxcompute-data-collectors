@@ -76,15 +76,125 @@
     (is (not (isa? driver/hierarchy :maxcompute :sql-mbql5))
         ":maxcompute must not derive from :sql-mbql5 (legacy-field reorder bug)")))
 
+(def ^:private escape-alias-lossless-cases
+  "Inputs whose fold is lossless: escaped identifier == input unchanged (v0.0.7
+   behavior, byte-for-byte; no hash suffix)."
+  ["simple" "with_space" "_9starts_with_digit" "padded" "cafe" "emoji_name"])
+
 (deftest ^:parallel escape-alias-test
-  (testing "escape-alias converts aliases to valid MaxCompute identifiers"
-    (are [input expected] (= expected (driver/escape-alias :maxcompute input))
-      "simple"                  "simple"
-      "with space"              "with_space"
-      "café"                    "cafe"
-      "9starts-with-digit"      "_9starts_with_digit"
-      "emoji🚀name"             "emoji_name"
-      "  padded  "              "padded")))
+  (testing "lossless folds are returned unchanged (v0.0.7 behavior, no hash suffix)"
+    (doseq [input escape-alias-lossless-cases]
+      (is (= input (driver/escape-alias :maxcompute input))
+          (str input " should roundtrip unchanged"))))
+
+  (testing "lossy folds are folded + `_` + crc32(original)"
+    (are [input folded] (let [escaped (driver/escape-alias :maxcompute input)]
+                          (and (str/starts-with? escaped (str folded \_))
+                               (= 9 (- (count escaped) (count folded)))))
+      "with space"         "with_space"
+      "café"               "cafe"
+      "9starts-with-digit" "_9starts_with_digit"
+      "emoji🚀name"        "emoji_name"
+      "  padded  "         "padded")
+    (testing "concrete CRC32 values are stable (golden values, computed from SQL reference impl)"
+      (is (= "cafe_98ad42b5" (driver/escape-alias :maxcompute "café"))))
+
+    (testing "every lossy fold ends in 8 lowercase hex chars"
+      (doseq [input ["with space" "café" "9starts-with-digit" "emoji🚀name" "  padded  "]]
+        (let [escaped (driver/escape-alias :maxcompute input)]
+          (is (re-matches #".*_[0-9a-f]{8}$" escaped)
+              (str (pr-str input) " -> " (pr-str escaped) " lacks CRC32 suffix")))))))
+
+;; 2026-09-08 second production incident (bi.siliconflow.cn v0.63.16.6 + driver
+;; v0.0.7): the 6-join card 432 compiles fine, but core add-alias-info uniquifies
+;; join aliases BEFORE escaping, so THREE distinct Chinese aliases
+;; (个人认证记录/机构认证信息/累计其他消费) all folded to `___________user_id` and
+;; MaxCompute rejected the SQL with ODPS-0130071 (ambiguous column). This test
+;; compiles a production-shaped 6-join query end-to-end and asserts per-join
+;; escape uniqueness at the SQL level.
+(defn- compile-6-join-query
+  "Compiles an MBQL query shaped like card 432 (source table + 6 left joins onto
+   sibling tables, each join pulling one field) to native SQL. Join aliases mirror
+   production exactly."
+  []
+  (let [mp (lib.tu/mock-metadata-provider
+             {:database {:lib/type :metadata/database, :id 1 :name "test-mc" :engine :maxcompute
+                         :details {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"}}
+              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "df_cs"}
+                         {:lib/type :metadata/table, :id 101 :name "personal_verify"}
+                         {:lib/type :metadata/table, :id 102 :name "org_verify"}
+                         {:lib/type :metadata/table, :id 103 :name "charge_refund_stats"}
+                         {:lib/type :metadata/table, :id 104 :name "maas_spending"}
+                         {:lib/type :metadata/table, :id 105 :name "faas_spending"}
+                         {:lib/type :metadata/table, :id 106 :name "other_expense"}]
+              :fields   (into [{:lib/type :metadata/column, :id 1001 :name "user_id" :table-id 100 :base-type :type/Text}]
+                              (mapcat (fn [[tid fld]]
+                                        [{:lib/type :metadata/column, :id (+ 2000 tid)
+                                          :name "user_id" :table-id tid :base-type :type/Text}
+                                         {:lib/type :metadata/column, :id (+ 2100 tid)
+                                          :name fld :table-id tid :base-type :type/Text}])
+                                      {100 "user_id" 101 "personal_user_id" 102 "org_user_id" 103 "stats_user_id"
+                                       104 "maas_user_id" 105 "faas_user_id" 106 "other_user_id"}))})]
+    (qp.store/with-metadata-provider mp
+      (driver/with-driver :maxcompute
+        (:query
+          (qp.compile/compile
+            {:database 1
+             :type     :query
+             :lib/metadata mp
+             :query    {:source-table 100
+                        :fields [[:field 1001 nil]]
+                        :joins   (mapv (fn [tid alias join-field-id]
+                                         {:strategy     :left-join
+                                          :alias        alias
+                                          :source-table tid
+                                          :condition    [:= [:field 1001 nil] [:field join-field-id nil]]
+                                          :fields       [[:field join-field-id nil]]})
+                                       [101 102 103 104 105 106]
+                                       ["用户个人认证记录 - user_id"
+                                        "用户机构认证信息 - user_id"
+                                        "用户充值退款累计统计 - user_id"
+                                        "用户 MaaS 累计消费 - user_id"
+                                        "用户 FaaS 累计消费 - user_id"
+                                        "用户累计其他消费 - user_id"]
+                                       [2101 2102 2103 2104 2105 2106])}}))))))
+
+
+(deftest integration-6-join-alias-uniqueness-test
+  (testing "end-to-end: a card-432-shaped 6-join query compiles with pairwise-distinct join aliases"
+    (let [sql (compile-6-join-query)]
+      (testing "all six LEFT JOINs are present"
+        (is (= 6 (count (re-seq #"(?i)LEFT JOIN" sql)))))
+      (testing "every join alias carries a CRC32 suffix (no bare underscore-mush aliases)"
+        (is (not (re-find #"`_{11}user_id`" sql))
+            "collided alias _______user_id (11 underscores) must not appear verbatim"))
+      (testing "escaped alias count: every LEFT JOIN introduces its own aliased subquery"
+        (is (<= 6 (count (re-seq #"[0-9a-f]{8}" sql)))
+            "expected six CRC32 suffixes (plus any from folded comparison predicates)")))))
+
+(deftest ^:parallel escape-alias-disambiguation-test
+  (testing "distinct non-ASCII aliases that fold identically escape to distinct identifiers
+            (production incident: card 432 on bi.siliconflow.cn, ODPS-0130071 ambiguous join alias)"
+    (let [prod-aliases ["用户个人认证记录 - user_id"
+                        "用户机构认证信息 - user_id"
+                        "用户充值退款累计统计 - user_id"
+                        "用户 MaaS 累计消费 - user_id"
+                        "用户 FaaS 累计消费 - user_id"
+                        "用户累计其他消费 - user_id"]
+          escaped      (mapv #(driver/escape-alias :maxcompute %) prod-aliases)]
+      (testing "under the OLD v0.0.7 logic these collapsed onto shared underscore mush"
+        ;; the six fold into only 4 distinct identifiers: the three 8-char
+        ;; Chinese prefixes (个人认证记录/机构认证信息/累计其他消费) collapse onto
+        ;; `___________user_id` — that triple collision is the incident.
+        (is (= 4 (count (distinct (map #(str/replace % #"[^\w\d_]" "_")
+                                       prod-aliases))))))
+      (testing "with the hash suffix, all six escaped values are pairwise distinct"
+        (is (= (count escaped) (count (distinct escaped)))
+            (str "escaped aliases must be unique, got: " (pr-str escaped))))
+      (testing "each escaped value is a MaxCompute-valid identifier: ^[A-Za-z_][A-Za-z0-9_]*$"
+        (doseq [e escaped]
+          (is (re-matches #"[A-Za-z_][A-Za-z0-9_]*" e)
+              (str (pr-str e) " is not a valid MaxCompute identifier")))))))
 
 (deftest ^:parallel inline-value-string-test
   (testing "inline-value for String returns a quoted SQL string literal with escaped single quotes"

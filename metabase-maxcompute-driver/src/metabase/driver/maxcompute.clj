@@ -940,18 +940,59 @@
                 (sql.qp/datetime-diff driver unit x y)))
 
 
+(defn- crc32-hex
+  "CRC32 of `s`'s UTF-8 bytes as 8-char zero-padded hex, e.g. `30de4302`.
+   Mirrors lib/util/unique-name-generator's `crc32-checksum` (same algorithm core
+   uses for truncated aliases), re-implemented here so the driver stays self-contained
+   across metabase-core versions."
+  ^String [^String s]
+  (let [raw (Long/toHexString (.getValue (doto (java.util.zip.CRC32.)
+                                           (.update (.getBytes s "UTF-8")))))]
+    (loop [r raw]
+      (if (< (count r) 8)
+        (recur (str \0 r))
+        r))))
+
+(defn- collision-safe-escape-alias
+  "Escape `s` to a valid MaxCompute identifier; when the fold is LOSSY (it actually
+   replaced characters), also append the original string's CRC32.
+
+   Why: core add-alias-info uniquifies join aliases BEFORE escaping
+   (`(comp escape-fn unique-name-generator)` — uniquify first, escape second, in
+   that order). Distinct non-ASCII aliases like 「用户个人认证记录 - user_id」 and
+   「用户累计其他消费 - user_id」 both fold to underscore mush like `___________user_id`,
+   so distinct joins collide and MaxCompute rejects the SQL with ODPS-0130071
+   (`user_id is ambiguous`). Core is unaware of the collision because its uniquify
+   pass ran on the PRE-fold names; upstream master still has this order today.
+   Appending a hash of the ORIGINAL (pre-fold) string makes post-fold results
+   distinct again, deterministically, for any pair of distinct originals.
+
+   Lossless folds keep <= v0.0.7 behavior byte-for-byte (no suffix), so existing
+   queries compile to exactly the same SQL as before."
+  [driver s]
+  (let [normalized (-> (str/trim s)
+                       u/remove-diacritical-marks)
+        folded    (-> normalized
+                      (str/replace #"[^\w\d_]" "_")
+                      (str/replace #"(^\d)" "_$1"))]
+    (if (= folded s)
+      ;; lossless fold: the identifier equals the original string unchanged —
+      ;; identical behavior to v0.0.7 and earlier, byte-for-byte.
+      ((get-method driver/escape-alias :metabase.driver/driver) driver folded)
+      ;; LOSSY fold (trim, diacritics, char replacement, or digit prefix — any
+      ;; change vs the ORIGINAL string): two distinctly-written originals can
+      ;; collide onto the same identifier (e.g. 「用户个人认证记录 - user_id」 vs
+      ;; 「用户累计其他消费 - user_id」, or 「café」 vs 「cafe」, or 「9x」 vs
+      ;; 「_9x」). Disambiguate with a deterministic hash of the original.
+      (let [hashed (str folded \_ (crc32-hex s))]
+        ((get-method driver/escape-alias :metabase.driver/driver) driver hashed)))))
+
 (defmethod driver/escape-alias :maxcompute
            [driver s]
            ;; Convert field alias `s` to a valid MaxCompute field identifier. From the dox: Fields must contain only letters,
            ;; numbers, and underscores, start with a letter or underscore, and be at most 128 characters long.
-           (let [s (-> (str/trim s)
-                       u/remove-diacritical-marks
-                       (str/replace #"[^\w\d_]" "_")
-                       (str/replace #"(^\d)" "_$1"))]
-                ;; :metabase.driver/driver is the default impl in metabase.driver, which calls
-                ;; driver.impl/truncate-alias. Can't use ::driver here because in this namespace
-                ;; it would resolve to :metabase.driver.maxcompute/driver.
-                ((get-method driver/escape-alias :metabase.driver/driver) driver s)))
+           (collision-safe-escape-alias driver s))
+
 
 (defmethod unprepare/unprepare-value [:maxcompute String]
            [_ s]

@@ -99,7 +99,7 @@
                               ;; Does this driver support standard deviation and variance aggregations? Note that if variance is not supported
                               ;; directly, you can calculate it manually by taking the square of the standard deviation. See the MongoDB driver
                               ;; for example.
-                              :standard-deviation-aggregations        false
+                              :standard-deviation-aggregations        true
 
                               ;; Does this driver support expressions (e.g. adding the values of 2 columns together)?
                               :expressions                            true
@@ -136,7 +136,7 @@
                               :persist-models-enabled                 false
 
                               ;; Does the driver support binning as specified by the `binning-strategy` clause?
-                              :binning                                false
+                              :binning                                true
 
                               ;; Does this driver not let you specify whether or not our string search filter clauses (`:contains`,
                               ;; `:starts-with`, and `:ends-with`, collectively the equivalent of SQL `LIKE`) are case-senstive or not? This
@@ -149,15 +149,15 @@
                               :left-join                              true
                               :right-join                             true
                               :inner-join                             true
-                              :full-join                              false
+                              :full-join                              true
 
-                              :regex                                  false
+                              :regex                                  true
 
                               ;; Does the driver support advanced math expressions such as log, power, ...
-                              :advanced-math-expressions              false
+                              :advanced-math-expressions              true
 
                               ;; Does the driver support percentile calculations (including median)
-                              :percentile-aggregations                false
+                              :percentile-aggregations                true
 
                               ;; Does the driver support date extraction functions? (i.e year('1970/03/09'))
                               ;; DEFAULTS TO TRUE
@@ -172,7 +172,7 @@
 
                               ;; Does the driver support converting timezone?
                               ;; DEFAULTS TO FALSE
-                              :convert-timezone                       false
+                              :convert-timezone                       true
 
                               ;; Does the driver support :datetime-diff functions
                               :datetime-diff                          true
@@ -904,41 +904,27 @@
            [driver [_ arg pattern]]
            [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
 
-(defn- percentile->quantile
-       [x]
-       (loop [x     (double x)
-              power (int 0)]
-             (if (zero? (- x (Math/floor x)))
-               [(Math/round x) (Math/round (Math/pow 10 power))]
-               (recur (* 10 x) (inc power)))))
-
-(defn- format-approx-quantiles
-       [_tag [expr offset quantiles :as _args]]
-       (let [[expr-sql & expr-args]           (sql/format-expr expr {:nested true})
-             [offset-sql & offset-args]       (sql/format-expr offset {:nested true})
-             [quantiles-sql & quantiles-args] (sql/format-expr quantiles {:nested true})]
-            (into [(format "APPROX_QUANTILES(%s, %s)[OFFSET(%s)]" expr-sql quantiles-sql offset-sql)]
+(defn- format-percentile
+       [_tag [expr p :as _args]]
+       (let [[expr-sql & expr-args] (sql/format-expr expr {:nested true})
+             [p-sql & p-args]       (sql/format-expr p {:nested true})]
+            (into [(format "PERCENTILE(%s, %s)" expr-sql p-sql)]
                   cat
-                  [expr-args quantiles-args offset-args])))
+                  [expr-args p-args])))
 
-(sql/register-fn! ::approx-quantiles #'format-approx-quantiles)
+(sql/register-fn! ::percentile #'format-percentile)
 
-(defn- approx-quantiles
-       "HoneySQL form for the APPROX_QUANTILES invocation. The [OFFSET(...)] part after the function call is odd and
-       needs special treatment."
-       [expr offset quantiles]
-       (let [offset    (if (number? offset)
-                         [:inline offset]
-                         offset)
-             quantiles (if (number? quantiles)
-                         [:inline quantiles]
-                         quantiles)]
-            [::approx-quantiles expr offset quantiles]))
-
+;; 2026-10-22 engine-verified (live df_cs_673150): PERCENTILE(x, p) is the native
+;; form and takes p as a 0..1 fraction — 1..10 gives p50=5.5 / p90=9.1, and
+;; MEDIAN(x) == PERCENTILE(x, 0.5). The previous implementation emitted
+;; APPROX_QUANTILES(x, n)[OFFSET(k)], a BigQuery function this engine does not
+;; have (ODPS-0130071; the `odps.sql.bigquery.compatible` connection setting does
+;; not enable it either — SAFE_DIVIDE fails the same way), so the code path was
+;; dead while the feature flag kept it out of the UI.
 (defmethod sql.qp/->honeysql [:maxcompute :percentile]
            [driver [_ expr p]]
-           (let [[offset quantiles] (percentile->quantile p)]
-                (approx-quantiles (sql.qp/->honeysql driver expr) offset quantiles)))
+           [::percentile (sql.qp/->honeysql driver expr)
+            (if (number? p) [:inline (double p)] p)])
 
 (defmethod sql.qp/->honeysql [:maxcompute :median]
            [driver [_ arg]]

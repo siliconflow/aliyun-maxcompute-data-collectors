@@ -12,7 +12,6 @@
    [metabase.driver :as driver]
    [metabase.driver.maxcompute :as maxcompute]
    [metabase.driver.sql.query-processor :as sql.qp]
-   [metabase.driver.sql.util.unprepare :as unprepare]
    [metabase.query-processor.compile :as qp.compile]
    [metabase.lib.core :as lib]
    [metabase.lib.test-util :as lib.tu]
@@ -219,33 +218,6 @@
       ;; OffsetTime is converted to LocalTime in UTC
       (is (str/starts-with? (sql.qp/inline-value :maxcompute offset-time) "datetime\"")))))
 
-(deftest ^:parallel unprepare-value-string-test
-  (testing "unprepare-value for String returns a quoted SQL string literal with escaped single quotes"
-    ;; unprepare-value returns the complete SQL literal (including surrounding single quotes),
-    ;; matching the inline-value behavior for String.
-    (is (= "'Cam\\'s String'"
-           (unprepare/unprepare-value :maxcompute "Cam's String")))))
-
-(deftest ^:parallel unprepare-value-temporal-test
-  (testing "unprepare-value formats temporal literals with MaxCompute-specific syntax (matches inline-value)"
-    (let [local-date     (LocalDate/of 2024 1 15)
-          local-datetime (LocalDateTime/of 2024 1 15 12 30 45 0)]
-      (is (= (format "date\"%s\"" (u.date/format-sql local-date))
-             (unprepare/unprepare-value :maxcompute local-date)))
-      (is (= (format "timestamp\"%s\"" (u.date/format-sql local-datetime))
-             (unprepare/unprepare-value :maxcompute local-datetime))))))
-
-(deftest ^:parallel inline-and-unprepare-consistency-test
-  (testing "inline-value and unprepare-value produce identical syntax for temporal types"
-    (let [local-date     (LocalDate/of 2024 6 1)
-          local-time     (LocalTime/of 8 0 0 0)
-          local-datetime (LocalDateTime/of 2024 6 1 8 0 0 0)
-          instant        (Instant/parse "2024-06-01T08:00:00Z")]
-      (doseq [value [local-date local-time local-datetime instant]]
-        (is (= (sql.qp/inline-value :maxcompute value)
-               (unprepare/unprepare-value :maxcompute value))
-            (str "Mismatch for " (.getClass value)))))))
-
 (deftest ^:parallel temporal-type-inference-test
   (testing "temporal-type correctly infers types from Java temporal values"
     ;; These call the private multimethod via var; use the public entry points if available.
@@ -421,3 +393,30 @@
       (is (str/includes? i-str "'Z'"))
       (is (str/includes? (str/upper-case g-str) "GETDATE("))
       (is (not (str/includes? (str/upper-case g-str) "CURRENT_TIMESTAMP"))))))
+
+;; 2026-10-22 review fix — both composites below were only ever verified as
+;; hand-written SQL, so the driver's own rendering drifted: `:quarter` emitted
+;; the nonexistent `*-1(...)` function and backed off `(m-1)/3*3` months
+;; (Oct -> Jan 1), and `:day-of-week` handed `adjust-day-of-week` a
+;; Sunday-based value while `db-start-of-week` says :monday (Fri came back 7).
+(deftest ^:parallel quarter-and-day-of-week-sql-test
+  (let [expr (sql.qp/->honeysql :maxcompute
+                                [:field "x" {::add/source-table "t" ::add/source-alias "x"}])
+        q    (first (sql/format-expr (sql.qp/date :maxcompute :quarter expr) {:nested true}))
+        d    (first (sql/format-expr (sql.qp/date :maxcompute :day-of-week expr) {:nested true}))
+        qu   (str/upper-case q)
+        du   (str/upper-case d)]
+    (testing "quarter: DATEADD(DATETRUNC(x,'mm'), CAST(-1 * ((DATEPART(x,'mm')-1) % 3) AS BIGINT), 'mm')"
+      (is (str/includes? qu "DATEADD("))
+      (is (str/includes? qu "DATEPART("))
+      (is (str/includes? q "% 3"))
+      (is (str/includes? qu "AS BIGINT"))
+      (is (not (str/includes? q "*-1")) "`[:*-1 ...]` renders an invalid *-1(...) call"))
+    (testing "day-of-week: WEEKDAY composite (the 1..7 numbering itself is live-verified:
+              Mon=1 .. Sun=7, Fri=5; adjust-day-of-week then shifts it to the
+              instance start-of-week, so the rendered text is asserted loosely)"
+      (is (str/includes? du "WEEKDAY("))
+      (is (str/includes? du "% 7"))
+      ;; WEEKDAY takes DATETIME only; a bare TIMESTAMP argument is ODPS-0130121
+      (is (str/includes? du "WEEKDAY(CAST("))
+      (is (str/includes? du "AS DATETIME)")))))

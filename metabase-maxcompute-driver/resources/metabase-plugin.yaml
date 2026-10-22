@@ -12,7 +12,7 @@ info:
   # For now core Metabase modules should have a version
   # 1.0.0-SNAPSHOT-x until version 1.0 ships and the API for plugins
   # is locked in
-  version: 0.0.8
+  version: 0.2.0
 
   # Describe what your plugin does. Not used currently, but in the
   # future we may use this description in a plugins admin page.
@@ -107,5 +107,5 @@ init:
     class: com.aliyun.odps.jdbc.OdpsDriver
 
 contact-info:
-  name: Jason Zhang
-  address: zhangdingxin.zdx@alibaba-inc.com
+  name: Alibaba Cloud MaxCompute
+  address: https://www.alibabacloud.com/help/en/maxcompute/

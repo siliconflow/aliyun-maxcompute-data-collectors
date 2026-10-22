@@ -393,3 +393,25 @@
       (is (str/includes? i-str "'Z'"))
       (is (str/includes? (str/upper-case g-str) "GETDATE("))
       (is (not (str/includes? (str/upper-case g-str) "CURRENT_TIMESTAMP"))))))
+
+;; 2026-10-22 capability gap fills (engine-verified against live df_cs_673150).
+;; The feature flags flipped in this round are :percentile-aggregations,
+;; :standard-deviation-aggregations, :advanced-math-expressions, :regex,
+;; :binning, :full-join and :convert-timezone. `driver/database-supports?`
+;; needs an initialized driver, which unit tests do not have, so the SQL shape
+;; below is what is pinned here.
+(deftest ^:parallel percentile-sql-test
+  (testing "percentile/median use the native PERCENTILE(x, p), never APPROX_QUANTILES"
+    (let [field [::add/source-table "t" ::add/source-alias "x"]
+          rendered (fn [p]
+                     (first (sql/format-expr
+                             (sql.qp/->honeysql :maxcompute
+                                                [:percentile [:field "x" field] p])
+                             {:nested true})))
+          median-str (first (sql/format-expr
+                             (sql.qp/->honeysql :maxcompute [:median [:field "x" field]])
+                             {:nested true}))]
+      (is (re-find #"(?i)PERCENTILE\(.+0\.9\)" (rendered 0.9)))
+      (is (re-find #"(?i)PERCENTILE\(.+0\.5\)" (rendered 0.5)))
+      (is (re-find #"(?i)PERCENTILE\(.+0\.5\)" median-str))
+      (is (not (str/includes? (str/upper-case median-str) "APPROX_QUANTILES"))))))

@@ -414,7 +414,49 @@
       (is (re-find #"(?i)PERCENTILE\(.+0\.9\)" (rendered 0.9)))
       (is (re-find #"(?i)PERCENTILE\(.+0\.5\)" (rendered 0.5)))
       (is (re-find #"(?i)PERCENTILE\(.+0\.5\)" median-str))
-      (is (not (str/includes? (str/upper-case median-str) "APPROX_QUANTILES"))))))
+      (is (not (str/includes? (str/upper-case median-str) "APPROX_QUANTILES")))
+      (testing "renamed aggregation carries a clause metadata map (production shape)"
+        (is (re-find #"(?i)PERCENTILE\(.+0\.9\)"
+                     (first (sql/format-expr
+                             (sql.qp/->honeysql :maxcompute
+                                                [:percentile {:name "input_p90"
+                                                              :display-name "input_p90"
+                                                              :effective-type :type/Integer}
+                                                 [:field "x" field] 0.9])
+                             {:nested true}))))
+        (is (re-find #"(?i)PERCENTILE\(.+0\.5\)"
+                     (first (sql/format-expr
+                             (sql.qp/->honeysql :maxcompute
+                                                [:median {:name "input_median"} [:field "x" field]])
+                             {:nested true}))))))))
+
+;; 2026-10-22 production bug: cards built in the GUI that end up as an aggregate
+;; over a source query rendered their inner columns as `schema`.`table`.`col`,
+;; which MaxCompute cannot resolve — only `` `project.schema.table`.`col` `` works
+;; (verified: `schema.table.col`, `table.col` both ODPS-0130071). The join/source-query
+;; guard in `should-qualify-identifier?` suppressed the project prefix for every
+;; field whose ::add/source-table was not an integer.
+(deftest ^:parallel nested-query-qualification-test
+  (let [mp (lib.tu/mock-metadata-provider
+             {:database {:lib/type :metadata/database, :id 1 :name "test-mc" :engine :maxcompute
+                         :details {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"}}
+              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "df_cs"}]
+              :fields   [{:lib/type :metadata/column, :id 1001 :name "user_id" :table-id 100 :base-type :type/Text}
+                         {:lib/type :metadata/column, :id 1002 :name "created_at" :table-id 100 :base-type :type/BigInteger}]})
+        sql-text (qp.store/with-metadata-provider mp
+                   (driver/with-driver :maxcompute
+                     (:query
+                       (qp.compile/compile-with-inline-parameters
+                         {:database 1
+                          :type     :query
+                          :lib/metadata mp
+                          :query    {:source-query {:source-table 100
+                                                    :fields [[:field 1001 nil] [:field 1002 nil]]}
+                                     :aggregation [[:count]]
+                                     :breakout    [[:field "user_id" {:base-type :type/Text}]]}}))))]
+    (is (str/includes? sql-text "`df_cs_673150.df_cs.users`.`user_id`")
+        "inner columns must be qualified with <project>.<schema>.<table> as one identifier")
+    (is (not (str/includes? sql-text "`df_cs`.`users`.`")))))
 
 
 ;; 2026-10-22 review fix — both composites below were only ever verified as

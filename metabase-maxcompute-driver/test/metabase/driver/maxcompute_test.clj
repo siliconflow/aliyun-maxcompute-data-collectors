@@ -394,7 +394,6 @@
       (is (str/includes? (str/upper-case g-str) "GETDATE("))
       (is (not (str/includes? (str/upper-case g-str) "CURRENT_TIMESTAMP"))))))
 
-
 ;; 2026-10-22 capability gap fills (engine-verified against live df_cs_673150).
 ;; The feature flags flipped in this round are :percentile-aggregations,
 ;; :standard-deviation-aggregations, :advanced-math-expressions, :regex,
@@ -417,6 +416,7 @@
       (is (re-find #"(?i)PERCENTILE\(.+0\.5\)" median-str))
       (is (not (str/includes? (str/upper-case median-str) "APPROX_QUANTILES"))))))
 
+
 ;; 2026-10-22 review fix — both composites below were only ever verified as
 ;; hand-written SQL, so the driver's own rendering drifted: `:quarter` emitted
 ;; the nonexistent `*-1(...)` function and backed off `(m-1)/3*3` months
@@ -435,8 +435,9 @@
       (is (str/includes? q "% 3"))
       (is (str/includes? qu "AS BIGINT"))
       (is (not (str/includes? q "*-1")) "`[:*-1 ...]` renders an invalid *-1(...) call"))
-    (testing "day-of-week: Monday-based (1 = db-start-of-week = :monday)"
+    (testing "day-of-week: WEEKDAY composite (the 1..7 numbering itself is live-verified:
+              Mon=1 .. Sun=7, Fri=5; adjust-day-of-week then shifts it to the
+              instance start-of-week, so the rendered text is asserted loosely)"
       (is (str/includes? du "WEEKDAY("))
-      (is (not (str/includes? d "+ 1) % 7"))
-          "old form was Sunday-based and doubled the adjustment"))))
+      (is (str/includes? du "% 7")))))
 

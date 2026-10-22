@@ -758,13 +758,24 @@
            (h2x/+ [:datediff expr (trunc :year expr) (h2x/literal "dd")] [:inline 1]))
 (defmethod sql.qp/date [:maxcompute :month]            [_ _ expr] (trunc   :month     expr))
 (defmethod sql.qp/date [:maxcompute :month-of-year]    [_ _ expr] (extract :month     expr))
-;; 'quarter' is NOT a DATETRUNC token (0130071). Engine-verified composite:
-;; truncate to month, then back off (month-1) DIV 3 * 3 months (U3/U4 audit).
+;; 'quarter' is NOT a DATETRUNC token (0130071). Re-engine-verified 2026-10-22
+;; against the live project through the driver's own generated SQL:
+;;   * DATEADD takes a BIGINT shift — integer `/` yields DOUBLE on this engine
+;;     (ODPS-0130071 "dateadd cannot match any overloaded functions with
+;;     (DATETIME, DOUBLE, STRING)"), so the shift is CAST(... AS BIGINT);
+;;   * the back-off is `-((month - 1) % 3)` months, NOT `(month-1)/3*3`: with
+;;     the old arithmetic Oct landed on Jan 1 instead of Oct 1;
+;;   * `[:*-1 ...]` is not a HoneySQL operator — it rendered as `*-1(...)`, an
+;;     invalid function call. Use `[:* [:inline -1] ...]`.
+;; Verified: Oct/Dec -> Oct 1, Jun -> Apr 1, Jan -> Jan 1.
 (defmethod sql.qp/date [:maxcompute :quarter]
            [_driver _unit expr]
            [:dateadd
             (trunc :month expr)
-            [:*-1 (h2x// (h2x/- [:datepart expr (h2x/literal "mm")] [:inline 1]) [:inline 3]) [:inline 3]]
+            (h2x/cast :bigint
+                      (h2x/* [:inline -1]
+                             (h2x/mod (h2x/- [:datepart expr (h2x/literal "mm")] [:inline 1])
+                                      [:inline 3])))
             (h2x/literal "mm")])
 (defmethod sql.qp/date [:maxcompute :quarter-of-year]
            [_driver _unit expr]
@@ -777,15 +788,19 @@
 ;; The day-of-week method below switched from the (removed) ::mod clause to
 ;; h2x/mod, which renders the `%` operator.
 
-;; 2026-09-08 engine-audit fix: `EXTRACT(dayofweek FROM x)` is a parse error on
-;; MaxCompute, and `DATEPART(x, 'dayofweek')` is 0130071. Engine-verified order:
-;; WEEKDAY(x) = Mon=0..Sun=6, so ((WEEKDAY(x)+1) % 7) + 1 gives Sun=1..Sat=7
-;; before the start-of-week adjustment (T6/V7 audit).
+;; `EXTRACT(dayofweek FROM x)` is a parse error on MaxCompute and
+;; `DATEPART(x, 'dayofweek')` is 0130071, so day-of-week is a WEEKDAY composite.
+;; WEEKDAY(x) = Mon=0..Sun=6, and `adjust-day-of-week` requires the value the
+;; driver hands it to be 1..7 with 1 = `db-start-of-week` — which this driver
+;; declares as :monday. Hence `((WEEKDAY(x) % 7) + 1)`: Mon=1 … Sun=7.
+;; Re-engine-verified 2026-10-22 through generated SQL: Fri=5, Sun=7, Mon=1;
+;; the previous ((WEEKDAY+1) % 7)+1 form was Sunday-based and returned Fri=7
+;; after the start-of-week adjustment (off by two).
 (defmethod sql.qp/date [:maxcompute :day-of-week]
            [driver _ expr]
            (sql.qp/adjust-day-of-week
              driver
-             (h2x/+ (h2x/mod (h2x/+ [:weekday expr] [:inline 1]) [:inline 7]) [:inline 1])
+             (h2x/+ (h2x/mod [:weekday expr] [:inline 7]) [:inline 1])
              (driver.common/start-of-week-offset driver)
              h2x/mod))
 

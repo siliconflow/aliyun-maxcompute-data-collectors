@@ -793,14 +793,18 @@
 ;; WEEKDAY(x) = Mon=0..Sun=6, and `adjust-day-of-week` requires the value the
 ;; driver hands it to be 1..7 with 1 = `db-start-of-week` — which this driver
 ;; declares as :monday. Hence `((WEEKDAY(x) % 7) + 1)`: Mon=1 … Sun=7.
-;; Re-engine-verified 2026-10-22 through generated SQL: Fri=5, Sun=7, Mon=1;
-;; the previous ((WEEKDAY+1) % 7)+1 form was Sunday-based and returned Fri=7
-;; after the start-of-week adjustment (off by two).
+;;
+;; WEEKDAY accepts DATETIME only — on a TIMESTAMP argument the engine raises
+;; ODPS-0130121 "invalid type TIMESTAMP of argument 1 for function weekday,
+;; expect DATETIME", which broke every day-of-week bucket on timestamp-typed or
+;; unix-ms-coerced columns. Cast first (verified 2026-10-22 through the driver's
+;; own generated SQL: Fri=5, Sun=7, Mon=1 after the start-of-week shift,
+;; Fri=6 under the default Sunday start-of-week).
 (defmethod sql.qp/date [:maxcompute :day-of-week]
            [driver _ expr]
            (sql.qp/adjust-day-of-week
              driver
-             (h2x/+ (h2x/mod [:weekday expr] [:inline 7]) [:inline 1])
+             (h2x/+ (h2x/mod [:weekday (h2x/cast :datetime expr)] [:inline 7]) [:inline 1])
              (driver.common/start-of-week-offset driver)
              h2x/mod))
 

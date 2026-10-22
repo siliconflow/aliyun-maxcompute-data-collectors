@@ -416,4 +416,7 @@
               Mon=1 .. Sun=7, Fri=5; adjust-day-of-week then shifts it to the
               instance start-of-week, so the rendered text is asserted loosely)"
       (is (str/includes? du "WEEKDAY("))
-      (is (str/includes? du "% 7")))))
+      (is (str/includes? du "% 7"))
+      ;; WEEKDAY takes DATETIME only; a bare TIMESTAMP argument is ODPS-0130121
+      (is (str/includes? du "WEEKDAY(CAST("))
+      (is (str/includes? du "AS DATETIME)")))))

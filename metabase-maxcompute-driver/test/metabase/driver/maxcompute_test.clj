@@ -209,14 +209,17 @@
           offset-time    (OffsetTime/of 12 30 45 0 (t/zone-offset 8))]
       (is (= (format "date\"%s\"" (u.date/format-sql local-date))
              (sql.qp/inline-value :maxcompute local-date)))
-      (is (= (format "datetime\"%s\"" (u.date/format-sql local-time))
+      ;; a bare datetime"hh:mm:ss" is ODPS-0130161 on this engine, so the wall
+      ;; clock is anchored to the epoch date
+      (is (= (format "datetime\"1970-01-01 %s\"" (u.date/format-sql local-time))
              (sql.qp/inline-value :maxcompute local-time)))
       (is (= (format "timestamp\"%s\"" (u.date/format-sql local-datetime))
              (sql.qp/inline-value :maxcompute local-datetime)))
-      (is (= (format "timestamp\"%s\"" (u.date/format-sql instant))
+      ;; instants are emitted as <UTC wall clock>Z (a datetime literal may not carry a zone)
+      (is (= (format "timestamp\"%sZ\"" (u.date/format-sql (t/local-date-time (t/offset-date-time instant (t/zone-offset 0)))))
              (sql.qp/inline-value :maxcompute instant)))
       ;; OffsetTime is converted to LocalTime in UTC
-      (is (str/starts-with? (sql.qp/inline-value :maxcompute offset-time) "datetime\"")))))
+      (is (str/starts-with? (sql.qp/inline-value :maxcompute offset-time) "datetime\"1970-01-01 ")))))
 
 (deftest ^:parallel temporal-type-inference-test
   (testing "temporal-type correctly infers types from Java temporal values"
@@ -486,3 +489,54 @@
       (is (str/includes? du "WEEKDAY(CAST("))
       (is (str/includes? du "AS DATETIME)")))))
 
+
+;; 2026-10-22 production bug: an absolute-datetime filter rendered
+;; TIMESTAMP(datetime"2026-10-15 23:00:00Z") and the engine rejected it
+;; (ODPS-0130161 invalid DATETIME format). `datetime"..."` never accepts a zone
+;; suffix; instants must be inlined as `timestamp"<UTC wall clock>Z"`, which the
+;; engine honours (23:00Z reads back as 07:00+08:00), and a time-of-day needs a
+;; date anchor because `datetime"23:00:00"` is also invalid.
+(deftest ^:parallel temporal-literal-inline-test
+  (let [utc-plus-8 (t/offset-date-time 2026 10 16 7 0 0 0 (t/zone-offset "+08:00"))
+        zdt       (t/zoned-date-time 2026 10 16 7 0 0 0 (t/zone-id "Asia/Shanghai"))
+        inst      (Instant/parse "2026-10-15T23:00:00Z")
+        inline    (fn [v] (sql.qp/inline-value :maxcompute v))]
+    (testing "instants carry a UTC wall clock and a trailing Z"
+      (is (= "timestamp\"2026-10-15 23:00:00Z\"" (inline utc-plus-8)))
+      (is (= "timestamp\"2026-10-15 23:00:00Z\"" (inline zdt)))
+      (is (= "timestamp\"2026-10-15 23:00:00Z\"" (inline inst))))
+    (testing "no zone suffix on datetime/date literals"
+      (is (= "timestamp\"2026-10-15 23:00:00\"" (inline (t/local-date-time 2026 10 15 23 0 0))))
+      (is (= "date\"2026-10-15\"" (inline (t/local-date 2026 10 15))))
+      (is (not (str/includes? (inline (t/local-date-time 2026 10 15 23 0 0)) "Z"))))
+    (testing "time-of-day literals are anchored to a date"
+      (is (= "datetime\"1970-01-01 23:00:00\"" (inline (t/local-time 23 0 0))))
+      (is (= "datetime\"1970-01-01 23:00:00\"" (inline (t/offset-time 23 0 0 0 (t/zone-offset 0))))))))
+
+;; 2026-10-22 sweep finding: core adds `ESCAPE '\'` to LIKE filters, which
+;; MaxCompute rejects (ODPS-0130161 invalid token) — every :contains /
+;; :starts-with / :ends-with filter failed. The engine has a built-in backslash
+;; escape, so the clause must be omitted.
+(deftest ^:parallel like-filter-sql-test
+  (let [mp (lib.tu/mock-metadata-provider
+             {:database {:lib/type :metadata/database, :id 1 :name "mc" :engine :maxcompute
+                         :details {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"}}
+              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "df_cs"}]
+              :fields   [{:lib/type :metadata/column, :id 1001 :name "ds" :table-id 100
+                          :base-type :type/Text :effective-type :type/Text}]})
+        compile-filter (fn [clause]
+                         (qp.store/with-metadata-provider mp
+                           (driver/with-driver :maxcompute
+                             (:query
+                               (qp.compile/compile-with-inline-parameters
+                                 {:database 1 :type :query :lib/metadata mp
+                                  :query {:source-table 100
+                                          :aggregation [[:count]]
+                                          :filter clause}})))))]
+    (testing "LIKE filters must not emit an ESCAPE clause"
+      (doseq [clause [[:contains [:field 1001 nil] "2026"]
+                      [:starts-with [:field 1001 nil] "2026"]
+                      [:ends-with [:field 1001 nil] "16"]]]
+        (let [sql-text (compile-filter clause)]
+          (is (str/includes? (str/upper-case sql-text) "LIKE"))
+          (is (not (str/includes? (str/upper-case sql-text) "ESCAPE"))))))))

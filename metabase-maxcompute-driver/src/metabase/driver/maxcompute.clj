@@ -1109,47 +1109,11 @@
            (collision-safe-escape-alias driver s))
 
 
-(defmethod unprepare/unprepare-value [:maxcompute String]
-           [_ s]
-           ;; escape single-quotes like Cam's String -> Cam\'s String
-           (str \' (str/replace s "'" "\\\\'") \'))
-
-(defmethod unprepare/unprepare-value [:maxcompute LocalTime]
-           [_ t]
-           (format "datetime\"%s\"" (u.date/format-sql t)))
-
-(defmethod unprepare/unprepare-value [:maxcompute LocalDate]
-           [_ t]
-           (format "date\"%s\"" (u.date/format-sql t)))
-
-(defmethod unprepare/unprepare-value [:maxcompute LocalDateTime]
-           [_ t]
-           (format "timestamp\"%s\"" (u.date/format-sql t)))
-
-(defmethod unprepare/unprepare-value [:maxcompute Instant]
-           [_ t]
-           (format "timestamp\"%s\"" (u.date/format-sql t)))
-
-(defmethod unprepare/unprepare-value [:maxcompute OffsetTime]
-           [_ t]
-           ;; convert to a LocalTime in UTC
-           (let [local-time (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))]
-                (format "datetime\"%s\"" (u.date/format-sql local-time))))
-
-(defmethod unprepare/unprepare-value [:maxcompute OffsetDateTime]
-           [_ t]
-           (format "datetime\"%s\"" (u.date/format-sql t)))
-
-(defmethod unprepare/unprepare-value [:maxcompute ZonedDateTime]
-           [_ t]
-           (format "datetime\"%s %s\"" (u.date/format-sql (t/local-date-time t)) (.getId (t/zone-id t))))
-
-;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             inline-value impls                                                |
 ;;; +----------------------------------------------------------------------------------------------------------------+
-;;; sql.qp/inline-value is the v0.51+ mechanism for inlining temporal literals when *compile-with-inline-parameters*
-;;; is true (used for native query compilation and certain prepared-statement fallback paths). The syntax must match
-;;; unprepare-value above so MaxCompute accepts the literal in both code paths.
+;;; sql.qp/inline-value is the mechanism for inlining temporal literals when *compile-with-inline-parameters*
+;;; is true (used for native query compilation and certain prepared-statement fallback paths). It replaced the
+;;; legacy `unprepare/unprepare-value` multimethod, which up to 0.1.1 this driver also implemented.
 
 (defmethod sql.qp/inline-value [:maxcompute String]
            [_ s]

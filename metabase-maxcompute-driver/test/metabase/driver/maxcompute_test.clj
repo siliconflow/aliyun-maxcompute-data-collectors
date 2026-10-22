@@ -12,7 +12,6 @@
    [metabase.driver :as driver]
    [metabase.driver.maxcompute :as maxcompute]
    [metabase.driver.sql.query-processor :as sql.qp]
-   [metabase.driver.sql.util.unprepare :as unprepare]
    [metabase.query-processor.compile :as qp.compile]
    [metabase.lib.core :as lib]
    [metabase.lib.test-util :as lib.tu]
@@ -218,33 +217,6 @@
              (sql.qp/inline-value :maxcompute instant)))
       ;; OffsetTime is converted to LocalTime in UTC
       (is (str/starts-with? (sql.qp/inline-value :maxcompute offset-time) "datetime\"")))))
-
-(deftest ^:parallel unprepare-value-string-test
-  (testing "unprepare-value for String returns a quoted SQL string literal with escaped single quotes"
-    ;; unprepare-value returns the complete SQL literal (including surrounding single quotes),
-    ;; matching the inline-value behavior for String.
-    (is (= "'Cam\\'s String'"
-           (unprepare/unprepare-value :maxcompute "Cam's String")))))
-
-(deftest ^:parallel unprepare-value-temporal-test
-  (testing "unprepare-value formats temporal literals with MaxCompute-specific syntax (matches inline-value)"
-    (let [local-date     (LocalDate/of 2024 1 15)
-          local-datetime (LocalDateTime/of 2024 1 15 12 30 45 0)]
-      (is (= (format "date\"%s\"" (u.date/format-sql local-date))
-             (unprepare/unprepare-value :maxcompute local-date)))
-      (is (= (format "timestamp\"%s\"" (u.date/format-sql local-datetime))
-             (unprepare/unprepare-value :maxcompute local-datetime))))))
-
-(deftest ^:parallel inline-and-unprepare-consistency-test
-  (testing "inline-value and unprepare-value produce identical syntax for temporal types"
-    (let [local-date     (LocalDate/of 2024 6 1)
-          local-time     (LocalTime/of 8 0 0 0)
-          local-datetime (LocalDateTime/of 2024 6 1 8 0 0 0)
-          instant        (Instant/parse "2024-06-01T08:00:00Z")]
-      (doseq [value [local-date local-time local-datetime instant]]
-        (is (= (sql.qp/inline-value :maxcompute value)
-               (unprepare/unprepare-value :maxcompute value))
-            (str "Mismatch for " (.getClass value)))))))
 
 (deftest ^:parallel temporal-type-inference-test
   (testing "temporal-type correctly infers types from Java temporal values"

@@ -21,6 +21,27 @@ policy:
   verified_cells_require_released_artifact: true
 
 releases:
+  - driver_version: 0.2.1
+    status: verification-pending
+    artifact: maxcompute-metabase-driver-0.2.1.jar
+    # Fixes two production defects found after 0.2.0 was deployed:
+    # * a percentile aggregation renamed in the GUI arrives as
+    #   [:percentile {metadata-map} expr 0.9], and passing that map to
+    #   ->honeysql failed with "Unexpected ->honeysql call on a map";
+    # * cards that become an aggregate over a source query rendered inner
+    #   columns as `schema`.`table`.`col`, which MaxCompute cannot resolve
+    #   (only `project.schema.table`.`col` works).
+    metabase:
+      target_range:
+        min_inclusive: 0.63.0
+        max_exclusive: 0.64.0
+      build_baseline: 0.63.16
+      window_note: >-
+        Same window as 0.2.0; deployed against the 0.63.18 production instance.
+    evidence: []
+    odps_jdbc:
+      version: 3.10.14
+      distribution: bundled
   - driver_version: 0.2.0
     status: verification-pending
     artifact: maxcompute-metabase-driver-0.2.0.jar

@@ -921,14 +921,27 @@
 ;; have (ODPS-0130071; the `odps.sql.bigquery.compatible` connection setting does
 ;; not enable it either — SAFE_DIVIDE fails the same way), so the code path was
 ;; dead while the feature flag kept it out of the UI.
+;; MBQL 5 may carry a clause metadata map as the first argument — a percentile
+;; aggregation renamed in the GUI arrives as
+;;   [:percentile {:name "input_p90" :display-name "input_p90" ...} expr 0.9]
+;; Core's [:sql :percentile] does not expect that shape either, so passing the map
+;; straight to ->honeysql failed with "Unexpected ->honeysql call on a map"
+;; (reproduced 2026-10-22 through /api/dataset/native on the production instance).
+;; Drop any map arguments before destructuring.
+(defn- drop-clause-metadata
+       [clause]
+       (remove map? (rest clause)))
+
 (defmethod sql.qp/->honeysql [:maxcompute :percentile]
-           [driver [_ expr p]]
-           [::percentile (sql.qp/->honeysql driver expr)
-            (if (number? p) [:inline (double p)] p)])
+           [driver clause]
+           (let [[expr p] (drop-clause-metadata clause)]
+                [::percentile (sql.qp/->honeysql driver expr)
+                 (if (number? p) [:inline (double p)] p)]))
 
 (defmethod sql.qp/->honeysql [:maxcompute :median]
-           [driver [_ arg]]
-           (sql.qp/->honeysql driver [:percentile arg 0.5]))
+           [driver clause]
+           (let [[arg] (drop-clause-metadata clause)]
+                (sql.qp/->honeysql driver [:percentile arg 0.5])))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -950,6 +963,17 @@
        (cond
          (::do-not-qualify? (meta identifier))
          false
+
+         ;; Fields rendered inside a source query / join are still real columns of a
+         ;; real table until an alias takes over; MaxCompute only resolves a column
+         ;; qualifier when the full `<project>.<schema>.<table>` is quoted as ONE
+         ;; identifier (`a.b.c`.`col`) — `schema`.`table`.`col` fails with
+         ;; ODPS-0130071 "column ... cannot be resolved" (verified on the production
+         ;; project 2026-10-22). Aliased fields carry two components ([alias col]) and
+         ;; stay unqualified; three-or-more components mean a real table, qualify it.
+         (and (= identifier-type :field)
+              (>= (count components) 3))
+         true
 
          ;; If we're currently using a Table alias, don't qualify the alias with the dataset name
          *field-is-from-join-or-source-query?*

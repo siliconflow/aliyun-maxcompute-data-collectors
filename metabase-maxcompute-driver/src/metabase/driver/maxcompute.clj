@@ -1103,8 +1103,12 @@
 
 (defmethod sql.qp/inline-value [:maxcompute String]
            [_ s]
-           ;; escape single-quotes like Cam's String -> Cam\'s String
-           (str \' (str/replace s "'" "\\\\'") \'))
+           ;; escape single-quotes like Cam's String -> Cam\'s String.
+           ;; Engine-verified: `'Cam\'s String'` returns Cam's String, while the
+           ;; doubled-backslash form upstream shipped (Cam\\'s String) breaks the
+           ;; literal, and SQL-standard doubled quotes ('it''s') silently evaluate
+           ;; to a literal concatenation ("its") rather than escaping the quote.
+           (str \' (str/replace s "'" "\\'") \'))
 
 (defmethod sql.qp/inline-value [:maxcompute LocalTime]
            [_ t]

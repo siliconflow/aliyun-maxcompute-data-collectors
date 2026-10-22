@@ -911,6 +911,20 @@
   :maxcompute
   (fn [_driver] :double))
 
+;; `LIKE` on MaxCompute has a built-in backslash escape and does NOT accept the
+;; SQL-standard ESCAPE clause — `... LIKE '%2026%' ESCAPE '\'` is ODPS-0130161
+;; "invalid token", and `ESCAPE '!'` fails the same way. Engine-verified that the
+;; escaping itself works without the clause:
+;;   'a%b' LIKE 'a\%b' -> true      'axb' LIKE 'a\%b' -> false
+;;   'a_b' LIKE 'a\_b' -> true      'axb' LIKE 'a\_b' -> false
+;; Core 0.59+ adds the clause via transform-literal-like-pattern-honeysql, which
+;; broke every :contains / :starts-with / :ends-with filter (found by the
+;; 2026-10-22 sweep). Drop the wrapper for this driver.
+(add-optional-method!
+  'metabase.driver.sql.query-processor/transform-literal-like-pattern-honeysql
+  :maxcompute
+  (fn [_driver like-rhs-honeysql] like-rhs-honeysql))
+
 (defmethod sql.qp/->honeysql [:maxcompute :regex-match-first]
            [driver clause]
            (let [[arg pattern] (drop-clause-metadata clause)]
@@ -1162,9 +1176,27 @@
            ;; to a literal concatenation ("its") rather than escaping the quote.
            (str \' (str/replace s "'" "\\'") \'))
 
+;; Temporal literal forms, engine-verified 2026-10-22 on the production project:
+;;   datetime"2026-10-15 23:00:00"        -> OK   (wall clock)
+;;   date"2026-10-15"                     -> OK
+;;   timestamp"2026-10-15 23:00:00"       -> OK
+;;   timestamp"2026-10-15 23:00:00Z"      -> OK   (Z is honoured: 23:00Z = 07:00+08:00)
+;;   timestamp"2026-10-16 07:00:00+08:00" -> OK but the offset is IGNORED (read as wall clock)
+;;   datetime"2026-10-15 23:00:00Z"       -> ODPS-0130161 invalid DATETIME format
+;;   datetime"2026-10-15 23:00:00+08:00"  -> ODPS-0130161 invalid DATETIME format
+;;   datetime"23:00:00"                   -> ODPS-0130161 invalid DATETIME format
+;; So: instants must be inlined as `timestamp"<UTC wall clock>Z"` (a `datetime`
+;; literal may never carry a zone), and time-of-day values need a date anchor.
+(defn- inline-utc-timestamp
+       "A timestamp literal for an instant-like value: UTC wall clock plus a Z suffix."
+       ^String [t]
+       (let [utc (t/offset-date-time t (t/zone-offset 0))]
+            (format "timestamp\"%sZ\"" (u.date/format-sql (t/local-date-time utc)))))
+
 (defmethod sql.qp/inline-value [:maxcompute LocalTime]
            [_ t]
-           (format "datetime\"%s\"" (u.date/format-sql t)))
+           ;; no TIME literal on this engine; anchor the wall clock to the epoch date
+           (format "datetime\"1970-01-01 %s\"" (u.date/format-sql t)))
 
 (defmethod sql.qp/inline-value [:maxcompute LocalDate]
            [_ t]
@@ -1176,21 +1208,21 @@
 
 (defmethod sql.qp/inline-value [:maxcompute Instant]
            [_ t]
-           (format "timestamp\"%s\"" (u.date/format-sql t)))
+           (inline-utc-timestamp t))
 
 (defmethod sql.qp/inline-value [:maxcompute OffsetTime]
            [_ t]
            ;; convert to a LocalTime in UTC
            (let [local-time (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))]
-                (format "datetime\"%s\"" (u.date/format-sql local-time))))
+                (format "datetime\"1970-01-01 %s\"" (u.date/format-sql local-time))))
 
 (defmethod sql.qp/inline-value [:maxcompute OffsetDateTime]
            [_ t]
-           (format "datetime\"%s\"" (u.date/format-sql t)))
+           (inline-utc-timestamp t))
 
 (defmethod sql.qp/inline-value [:maxcompute ZonedDateTime]
            [_ t]
-           (format "datetime\"%s %s\"" (u.date/format-sql (t/local-date-time t)) (.getId (t/zone-id t))))
+           (inline-utc-timestamp t))
 
 (def ^:private ^:dynamic *compiling-cumulative-aggregation* false)
 

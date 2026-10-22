@@ -1,63 +1,86 @@
 (ns metabase.driver.maxcompute
-    (:require
-      [cheshire.core :as json]
-      [clojure.string :as str]
-      [honey.sql :as hsql]
-      [honey.sql :as sql]
-      [java-time.api :as t]
-      [metabase.driver :as driver]
-      [metabase.driver.common :as driver.common]
-      [metabase.driver.sql :as driver.sql]
-      [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
-      [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
-      [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
-      [metabase.driver-api.core :as driver-api]
-      [metabase.driver.sql.parameters.substitution :as sql.params.substitution]
-      [metabase.driver.sql.query-processor :as sql.qp]
-      [metabase.driver.sql.util :as sql.u]
-      [metabase.driver.sql.util.unprepare :as unprepare]
-      [metabase.legacy-mbql.util :as mbql.u]
-      [metabase.lib.metadata :as lib.metadata]
-      [metabase.lib.schema.metadata :as lib.schema.metadata]
-      [metabase.query-processor.error-type :as qp.error-type]
-      [metabase.query-processor.store :as qp.store]
-      [metabase.query-processor.timezone :as qp.timezone]
-      [metabase.query-processor.util.add-alias-info :as add]
-      [metabase.secrets.core :as secrets]
-      [metabase.settings.models.setting :as setting]
-      [metabase.util :as u]
-      [metabase.util.date-2 :as u.date]
-      [metabase.util.honey-sql-2 :as h2x]
-      [metabase.util.i18n :refer [tru]]
-      [metabase.util.log :as log]
-      [metabase.util.malli :as mu])
-    (:import
-      (java.sql Connection ResultSet Time)
-      (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime Instant)
-      (java.util Date)
-      (com.aliyun.odps Column Table Project Odps OdpsException)
-      (com.aliyun.odps.jdbc OdpsConnection)
-      (com.aliyun.odps.account AliyunAccount)))
+  (:require
+   [cheshire.core :as json]
+   [clojure.string :as str]
+   [honey.sql :as sql]
+   [java-time.api :as t]
+   [metabase.driver :as driver]
+   [metabase.driver.common :as driver.common]
+   [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+   [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
+   [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
+   [metabase.driver.sql.parameters.substitution :as sql.params.substitution]
+   [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.sql.util :as sql.u]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.schema.metadata :as lib.schema.metadata]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.query-processor.store :as qp.store]
+   [metabase.query-processor.timezone :as qp.timezone]
+   [metabase.query-processor.util.add-alias-info :as add]
+   [metabase.util :as u]
+   [metabase.util.date-2 :as u.date]
+   [metabase.util.honey-sql-2 :as h2x]
+   [metabase.util.i18n :refer [tru]]
+   [metabase.util.log :as log]
+   [metabase.util.malli :as mu])
+  (:import
+   (com.aliyun.odps Odps OdpsException)
+   (com.aliyun.odps.account AliyunAccount)
+   (java.sql Connection ResultSet)
+   (java.time Instant LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZonedDateTime)))
 
 (set! *warn-on-reflection* true)
 
-;; 2026-09-08 production-incident lesson: do NOT register :sql-mbql5 as a
-;; parent. On v0.63.x, [:sql-mbql5 :field]'s forwarding shims REORDER legacy
-;; three-tuple clauses ([:field id-or-name opts]) into MBQL5 order before
-;; [:sql :field] destructures them with the legacy order — the alias info
-;; lands on the wrong slots and identifiers come out with EMPTY components
-;; ([:identifier :field []]), which renders as `SELECT AS `_x_`` / one-blob
-;; FROM in production (queryHash e0bfeb…, bi.siliconflow.cn). The official
-;; OSS driver 0.1.0 registers :sql-jdbc only and does not hit this; v0.0.6
-;; did, because it opted into :sql-mbql5. Register like the official driver.
-(driver/register! :maxcompute, :parent :sql-jdbc)
-(doseq [[feature supported?] {;; Does this database support following foreign key relationships while querying?
-                              ;; Note that this is different from supporting primary key and foreign key constraints in the schema; see below.
-                              :foreign-keys                           false
+(defn- resolve-compat-var
+  [& symbols]
+  (or (some (fn [symbol]
+              (try
+                (requiring-resolve symbol)
+                (catch java.io.FileNotFoundException _
+                  nil)))
+            symbols)
+      (throw (ex-info "No compatible Metabase API implementation found"
+                      {:symbols symbols}))))
 
-                              ;; Does this database track and enforce primary key and foreign key constraints in the schema?
+(defn- secret-value-as-string
+  [driver details property-name]
+  (if-let [driver-api-fn
+           (try
+             (requiring-resolve 'metabase.driver-api.core/secret-value-as-string)
+             (catch java.io.FileNotFoundException _
+               nil))]
+    (driver-api-fn driver details property-name)
+    ((resolve-compat-var
+       'metabase.models.secret/get-secret-string
+       'metabase.secrets.models.secret/get-secret-string)
+     details
+     property-name)))
+
+(defn- dispatch-by-clause-name-or-class
+  [clause]
+  ((resolve-compat-var
+     'metabase.driver-api.core/dispatch-by-clause-name-or-class
+     'metabase.legacy-mbql.util/dispatch-by-clause-name-or-class)
+   clause))
+
+(defn- setting-get-value-of-type
+  [value-type setting-name]
+  ((resolve-compat-var
+     'metabase.driver-api.core/setting-get-value-of-type
+     'metabase.models.setting/get-value-of-type)
+   value-type
+   setting-name))
+
+(defn- add-optional-method!
+  [multifn-symbol dispatch-value method]
+  (when-let [multifn-var (find-var multifn-symbol)]
+    (when (bound? multifn-var)
+      (.addMethod ^clojure.lang.MultiFn @multifn-var dispatch-value method))))
+
+(driver/register! :maxcompute, :parent :sql-jdbc)
+(doseq [[feature supported?] {;; Does this database track and enforce primary key and foreign key constraints in the schema?
                               ;; SQL query engines like Presto and Athena do not track these, though they can query across FKs.
-                              ;; See :foreign-keys above.
                               :metadata/key-constraints               false
 
                               ;; Does this database support nested fields for any and every field except primary key (e.g. Mongo)?
@@ -186,10 +209,6 @@
                               ;; Does the driver support column(s) support storing index info
                               :index-info                             false
 
-                              ;; Does the driver support a faster `sync-fks` step by fetching all FK metadata in a single collection?
-                              ;; if so, `metabase.driver/describe-fks` must be implemented instead of `metabase.driver/describe-table-fks`
-                              :describe-fks                           false
-
                               ;; Does the driver support a faster `sync-fields` step by fetching all FK metadata in a single collection?
                               ;; if so, `metabase.driver/describe-fields` must be implemented instead of `metabase.driver/describe-table`
                               :describe-fields                        false
@@ -221,8 +240,8 @@
 (def odps-instance (atom nil))
 (defmethod driver/can-connect? :maxcompute
            [driver details]
-           (let [{:keys [project endpoint ak sk namespace-schema]} details
-                 account (AliyunAccount. ak (secrets/value-as-string driver details "sk"))
+           (let [{:keys [project endpoint ak namespace-schema]} details
+                 account (AliyunAccount. ak (secret-value-as-string :maxcompute details "sk"))
                  odps (Odps. account)]
                 (.setEndpoint odps endpoint)
                 (.setDefaultProject odps project)
@@ -239,26 +258,9 @@
 ;; this convert "a"."b"."c" to `a`.`b`.`c`, which is necessary for maxcompute
 (defmethod sql.qp/quote-style :maxcompute [_] :mysql)
 
-
-;; 2026-09-08 production incident fix (bi.siliconflow.cn, v0.63.16.6 + driver
-;; v0.0.6): the legacy fork shipped TWO defmethods for
-;; `[:maxcompute ::h2x/identifier]` plus a `[:maxcompute :field]` wrapper
-;; whose "MBQL5 clause order detection" (require 'metabase.driver.sql-mbql5)
-;; matched on v0.63.x, reading opts at the wrong index for legacy-ordered
-;; clauses. Result: `[:identifier :field []]` — empty components — which
-;; malli rejects in dev (CI) and, with instrumentation off in production,
-;; silently renders as EMPTY select expressions (`SELECT AS `_key_``) and a
-;; one-blob FROM `project.db.table`. Both are engine errors
-;; (ODPS-0130071: column `as` cannot be resolved).
-;; All three are deleted: ::h2x/identifier now falls through to the
-;; [:sql ::h2x/identifier] identity default, and :field clauses compile
-;; through [:sql :field] directly — the same path the official OSS driver
-;; 0.1.0 exercises in production today.
-;; 2026-09-08 engine-audit fix: db-start-of-week was never defined for
-;; :maxcompute — grouping by Week in the visual query builder threw
-;; IllegalArgumentException (No method in multimethod 'db-start-of-week').
-;; MaxCompute DATETRUNC 'week' is Monday-based (G/O audits), matching
-;; Metabase's default :monday start of week.
+;; 2026-09-08 engine-audit fix: without this, grouping by Week throws
+;; "No method in multimethod 'db-start-of-week'". MaxCompute DATETRUNC 'week'
+;; is Monday-based, which is Metabase's default start of week.
 (defmethod driver/db-start-of-week :maxcompute
   [_]
   :monday)
@@ -273,19 +275,19 @@
                                    "odps.namespace.schema"           "true"
                                    "odps.sql.bigquery.compatible"    "true"
                                    "odps.sql.timezone"               (or timezone "Asia/Shanghai")}
-                 sk-value (secrets/value-as-string driver details-map "sk")
+                 sk-value (secret-value-as-string :maxcompute details-map "sk")
                  settings-map (merge default-settings (try
                                                         (when settings
-                                                              (json/parse-string settings true))
-                                                        (catch Exception e
-                                                          (println "Invalid settings JSON" settings)
+                                                              (json/parse-string settings))
+                                                        (catch Exception _
+                                                          (log/warn "Ignoring invalid MaxCompute settings JSON.")
                                                           {})))]
                 (if (or (nil? endpoint) (nil? project) (nil? ak) (nil? sk-value))
                   (throw (IllegalArgumentException. "Missing required connection details"))
                   {:classname   "com.aliyun.odps.jdbc.OdpsDriver"
                    :subprotocol "odps"
                    :subname     (str endpoint "?project=" project
-                                     "&enableOdpsLogger=true&charset=UTF-8&interactiveMode=true&enableLimit=false"
+                                     "&enableOdpsLogger=true&charset=UTF-8&interactiveMode=true&enableLimit=false&legacyArrayGetObject=false"
                                      (if (nil? quotaName) "" (str "&quotaName=" quotaName))
                                      "&settings=" (json/generate-string settings-map))
                    :user        ak
@@ -375,6 +377,21 @@
                   (catch Throwable e
                     (.close stmt)
                     (throw e)))))
+(defn ^:private project-id-for-current-query
+      []
+      (when (qp.store/initialized?)
+            (when-let [{:keys [details]} (lib.metadata/database (qp.store/metadata-provider))]
+                      (:project details))))
+
+(defn- valid-project-identifier?
+       "Is String `s` a valid MaxCompute project identifier (a.k.a. project-id)? Identifiers are only allowed to contain
+       letters, numbers, and underscores, cannot start with a number, and for project-id, can be at most 30 characters long."
+       [s]
+       (boolean (or (nil? s)
+                    (and (string? s)
+                         (re-matches #"^[a-zA-Z_0-9\.\-]{1,30}$" s)))))
+
+
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                       Running Queries & Parsing Results                                        |
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -459,7 +476,7 @@
 
 (defmulti ^:private temporal-type
           {:arglists '([x])}
-          driver-api/dispatch-by-clause-name-or-class
+          dispatch-by-clause-name-or-class
           :hierarchy #'temporal-type-hierarchy)
 
 (defmethod temporal-type LocalDate      [_] :date)
@@ -554,7 +571,7 @@
           calling [[->temporal-type]]); and should return a Honey SQL form."
           {:arglists '([target-type x])}
           (fn [target-type x]
-              [target-type (driver-api/dispatch-by-clause-name-or-class x)])
+              [target-type (dispatch-by-clause-name-or-class x)])
           :hierarchy #'temporal-type-hierarchy)
 
 (defn- throw-unsupported-conversion [from to]
@@ -856,6 +873,14 @@
            [_ value]
            (h2x/cast :double value))
 
+;; 2026-09-08 engine-audit fix: MaxCompute has no `float64` type (ODPS-0130071);
+;; DOUBLE is the native spelling. Registered for cores that took `->float` away
+;; in favour of `float-dbtype` (the `->float` defmethod above covers older cores).
+(add-optional-method!
+  'metabase.driver.sql.query-processor/float-dbtype
+  :maxcompute
+  (fn [_driver] :double))
+
 (defmethod sql.qp/->honeysql [:maxcompute :regex-match-first]
            [driver [_ arg pattern]]
            [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
@@ -905,12 +930,68 @@
 ;;; |                                                Query Processor                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-;; 2026-09-08 engine-audit fix: PARSE_DATETIME does not exist on MaxCompute
-;; (ODPS-0130071). Engine-verified native form (E4 audit):
-;; TO_DATE(x, 'yyyymmddhhmiss').
+;; this is a little hacky, I'm 99% sure we could just have the [[sql.qp/->honeysql]] method for `:field` swap out the
+;; `::add/source-table` to a `[project.dataset table]` pair but this will have to do for now.
+(def ^:private ^:dynamic *field-is-from-join-or-source-query?* false)
+
+(defn- should-qualify-identifier?
+       "Should we qualify an [[h2x/identifier]] with the dataset name?
+
+       Table & Field identifiers (usually) need to be qualified with the current dataset name; this needs to be part of the
+       table e.g.
+
+         `table`.`field` -> `dataset.table`.`field`"
+       [[_tag identifier-type components, :as identifier]]
+       (cond
+         (::do-not-qualify? (meta identifier))
+         false
+
+         ;; If we're currently using a Table alias, don't qualify the alias with the dataset name
+         *field-is-from-join-or-source-query?*
+         false
+
+         ;; otherwise always qualify Table identifiers
+         (= identifier-type :table)
+         true
+
+         ;; Only qualify Field identifiers that are qualified by a Table. (e.g. don't qualify stuff inside `CREATE TABLE`
+         ;; DDL statements)
+         (and (= identifier-type :field)
+              (>= (count components) 2))
+         true))
+
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/YYYYMMDDHHMMSSString->Temporal]
            [_driver _coercion-strategy expr]
            [:to_date expr (h2x/literal "yyyymmddhhmiss")])
+
+(defmethod sql.qp/->honeysql [:maxcompute ::h2x/identifier]
+           [_driver identifier]
+           (letfn [(prefix-components [[dataset-id table & more :as _components]]
+                                      (cons (str (when-let [proj-id (project-id-for-current-query)]
+                                                           (str proj-id \.))
+                                                 dataset-id
+                                                 \.
+                                                 table)
+                                            more))
+                   (update-identifier-prefix-components [[_tag identifier-type components]]
+                                                        (apply h2x/identifier identifier-type (prefix-components components)))]
+                  (cond-> identifier
+                          (should-qualify-identifier? identifier) update-identifier-prefix-components
+                          true                                    (vary-meta assoc ::do-not-qualify? true))))
+
+(defmethod sql.qp/->honeysql [:maxcompute :field]
+           [driver [_field _id-or-name {::add/keys [source-table], :as _opts} :as field-clause]]
+           (let [parent-method (get-method sql.qp/->honeysql [:sql :field])]
+                ;; if the Field is from a join or source table, record this fact so that we know never to qualify it with the
+                ;; project ID no matter what
+                (binding [*field-is-from-join-or-source-query?* (not (integer? source-table))]
+                         ;; attach temporal type info to the field clause, this will get attached to the resulting [[h2x/identifier]] by
+                         ;; SQL QP parent method, and we can access that inside other things like [[sql.qp/date]] implementations which it
+                         ;; may call in turn.
+                         (let [field-clause (with-temporal-type field-clause (temporal-type field-clause))
+                               result       (parent-method driver field-clause)]
+                              (cond-> result
+                                      (not (temporal-type result)) (with-temporal-type (temporal-type field-clause)))))))
 
 (defmethod sql.qp/->honeysql [:maxcompute :relative-datetime]
            [driver clause]
@@ -939,6 +1020,40 @@
                 (datetime-diff-check-args x y)
                 (sql.qp/datetime-diff driver unit x y)))
 
+;; 2026-09-08 engine-audit fixes — datetime-diff family (Z/AA audit):
+;; TIMESTAMP_DIFF / DATETIME_DIFF built-ins DO NOT exist on MaxCompute
+;; (ODPS-0130071). DATEDIFF(x, y, token) is the engine-verified native
+;; form (accepts DATETIME or TIMESTAMP args, AA1 audit) with short tokens
+;; 'dd','hh','mi','ss','mm','yyyy'. Month semantics: calendar-month
+;; boundaries; whole months = subtract 1 when day(x) < day(y) AND x>=y
+;; (Z1: 22→21; Z-negative dir unchanged: -22 for x<y dir, Z5/Z6 audit).
+(defmethod sql.qp/datetime-diff [:maxcompute :year]
+           [driver _unit x y]
+           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :month x y) [:inline 12])))
+(defmethod sql.qp/datetime-diff [:maxcompute :quarter]
+           [driver _unit x y]
+           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :month x y) [:inline 3])))
+(defmethod sql.qp/datetime-diff [:maxcompute :month]
+           [_driver _unit x y]
+           (h2x/- [:datediff x y (h2x/literal "mm")]
+                  [:case
+                   [:< [:datepart x (h2x/literal "dd")] [:datepart y (h2x/literal "dd")]] [:inline 1]
+                   :else [:inline 0]]))
+(defmethod sql.qp/datetime-diff [:maxcompute :week]
+           [driver _unit x y]
+           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :day x y) [:inline 7])))
+(defmethod sql.qp/datetime-diff [:maxcompute :day]
+           [_driver _unit x y]
+           [:datediff (trunc :day x) (trunc :day y) (h2x/literal "dd")])
+(defmethod sql.qp/datetime-diff [:maxcompute :hour]
+           [_driver _unit x y]
+           [:datediff x y (h2x/literal "hh")])
+(defmethod sql.qp/datetime-diff [:maxcompute :minute]
+           [_driver _unit x y]
+           [:datediff x y (h2x/literal "mi")])
+(defmethod sql.qp/datetime-diff [:maxcompute :second]
+           [_driver _unit x y]
+           [:datediff x y (h2x/literal "ss")])
 
 (defn- crc32-hex
   "CRC32 of `s`'s UTF-8 bytes as 8-char zero-padded hex, e.g. `30de4302`.
@@ -1037,39 +1152,39 @@
 ;;; unprepare-value above so MaxCompute accepts the literal in both code paths.
 
 (defmethod sql.qp/inline-value [:maxcompute String]
-  [_ s]
-  ;; escape single-quotes like Cam's String -> Cam\'s String
-  (str \' (str/replace s "'" "\\'") \'))
+           [_ s]
+           ;; escape single-quotes like Cam's String -> Cam\'s String
+           (str \' (str/replace s "'" "\\\\'") \'))
 
 (defmethod sql.qp/inline-value [:maxcompute LocalTime]
-  [_ t]
-  (format "datetime\"%s\"" (u.date/format-sql t)))
+           [_ t]
+           (format "datetime\"%s\"" (u.date/format-sql t)))
 
 (defmethod sql.qp/inline-value [:maxcompute LocalDate]
-  [_ t]
-  (format "date\"%s\"" (u.date/format-sql t)))
+           [_ t]
+           (format "date\"%s\"" (u.date/format-sql t)))
 
 (defmethod sql.qp/inline-value [:maxcompute LocalDateTime]
-  [_ t]
-  (format "timestamp\"%s\"" (u.date/format-sql t)))
+           [_ t]
+           (format "timestamp\"%s\"" (u.date/format-sql t)))
 
 (defmethod sql.qp/inline-value [:maxcompute Instant]
-  [_ t]
-  (format "timestamp\"%s\"" (u.date/format-sql t)))
+           [_ t]
+           (format "timestamp\"%s\"" (u.date/format-sql t)))
 
 (defmethod sql.qp/inline-value [:maxcompute OffsetTime]
-  [_ t]
-  ;; convert to a LocalTime in UTC
-  (let [local-time (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))]
-    (format "datetime\"%s\"" (u.date/format-sql local-time))))
+           [_ t]
+           ;; convert to a LocalTime in UTC
+           (let [local-time (t/local-time (t/with-offset-same-instant t (t/zone-offset 0)))]
+                (format "datetime\"%s\"" (u.date/format-sql local-time))))
 
 (defmethod sql.qp/inline-value [:maxcompute OffsetDateTime]
-  [_ t]
-  (format "datetime\"%s\"" (u.date/format-sql t)))
+           [_ t]
+           (format "datetime\"%s\"" (u.date/format-sql t)))
 
 (defmethod sql.qp/inline-value [:maxcompute ZonedDateTime]
-  [_ t]
-  (format "datetime\"%s %s\"" (u.date/format-sql (t/local-date-time t)) (.getId (t/zone-id t))))
+           [_ t]
+           (format "datetime\"%s %s\"" (u.date/format-sql (t/local-date-time t)) (.getId (t/zone-id t))))
 
 (def ^:private ^:dynamic *compiling-cumulative-aggregation* false)
 
@@ -1118,42 +1233,6 @@
            [target-type form]
            (-> (sql.qp/compiled (->temporal-type target-type form))
                (vary-meta assoc :maxcompute/temporal-type target-type)))
-
-;; ===================================================================
-;; 2026-09-08 engine-audit fixes — datetime-diff family (Z/AA audit):
-;; TIMESTAMP_DIFF / DATETIME_DIFF built-ins DO NOT exist on MaxCompute
-;; (ODPS-0130071). DATEDIFF(x, y, token) is the engine-verified native
-;; form (accepts DATETIME or TIMESTAMP args, AA1 audit) with short tokens
-;; 'dd','hh','mi','ss','mm','yyyy'. Month semantics: calendar-month
-;; boundaries; whole months = subtract 1 when day(x) < day(y) AND x>=y
-;; (Z1: 22→21; Z-negative dir unchanged: -22 for x<y dir, Z5/Z6 audit).
-(defmethod sql.qp/datetime-diff [:maxcompute :year]
-           [driver _unit x y]
-           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :month x y) [:inline 12])))
-(defmethod sql.qp/datetime-diff [:maxcompute :quarter]
-           [driver _unit x y]
-           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :month x y) [:inline 3])))
-(defmethod sql.qp/datetime-diff [:maxcompute :month]
-           [_driver _unit x y]
-           (h2x/- [:datediff x y (h2x/literal "mm")]
-                  [:case
-                   [:< [:datepart x (h2x/literal "dd")] [:datepart y (h2x/literal "dd")]] [:inline 1]
-                   :else [:inline 0]]))
-(defmethod sql.qp/datetime-diff [:maxcompute :week]
-           [driver _unit x y]
-           (h2x/cast :bigint (h2x// (sql.qp/datetime-diff driver :day x y) [:inline 7])))
-(defmethod sql.qp/datetime-diff [:maxcompute :day]
-           [_driver _unit x y]
-           [:datediff (trunc :day x) (trunc :day y) (h2x/literal "dd")])
-(defmethod sql.qp/datetime-diff [:maxcompute :hour]
-           [_driver _unit x y]
-           [:datediff x y (h2x/literal "hh")])
-(defmethod sql.qp/datetime-diff [:maxcompute :minute]
-           [_driver _unit x y]
-           [:datediff x y (h2x/literal "mi")])
-(defmethod sql.qp/datetime-diff [:maxcompute :second]
-           [_driver _unit x y]
-           [:datediff x y (h2x/literal "ss")])
 
 ;(defn- reconcile-temporal-types
 ;       "Make sure the temporal types of fields and values in filter clauses line up."
@@ -1280,10 +1359,6 @@
                                        sql.qp/source-query-alias)
                        :mbql?      true)))
 
-;; 2026-09-08 engine-audit fix: CURRENT_TIMESTAMP does not exist on MaxCompute
-;; (ODPS-0130071, K4 audit). GETDATE() is the native current moment (DATETIME
-;; with millisecond precision, K1) and CAST(GETDATE() AS timestamp|date|datetime)
-;; are all valid (T3 audit).
 (defn- format-current-moment
        [_tag [target-type _report-timezone :as _args]]
        (sql/format-expr
@@ -1316,10 +1391,7 @@
            (->> (sql.qp/current-datetime-honeysql-form driver)
                 (->temporal-type :timestamp)))
 
-;; 2026-09-08 engine-audit fix: MaxCompute LOG(base, value) — LOG(100,10)=0.5
-;; means LOG(a,b) = log_a(b), i.e. the FIRST arg is the base (T1 audit). The
-;; old form [:log field [:inline 10]] computed log_field(10), the exact
-;; inverse of log10(field). Correct: [:log [:inline 10] field].
+;; In MaxCompute, log syntax is `log(x, base)`
 (defmethod sql.qp/->honeysql [:maxcompute :log]
            [driver [_ field]]
            [:log [:inline 10] (sql.qp/->honeysql driver field)])
@@ -1362,30 +1434,25 @@
                                                                                                     arg))
                                                                                               args)))))))
 
-;; 2026-09-08 engine-audit fix: CAST('2024-01-15T12:30:45Z' AS datetime|date)
-;; compiles but silently returns NULL for ISO-8601 input on MaxCompute (E5/R1
-;; audit). Engine-verified shape strips 'T'/'Z' first (E6/AC3; fractional
-;; seconds survive into TIMESTAMP, AC4). For the Time target there is no TIME
-;; type on MaxCompute (L1 audit) — leave the generic cast.
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->DateTime]
            [_driver _semantic_type expr]
            (h2x/->datetime [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
-                                         (h2x/literal "Z") (h2x/literal "")]))
+                                     (h2x/literal "Z") (h2x/literal "")]))
 
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->Date]
            [_driver _semantic_type expr]
            (h2x/->date [:replace [:replace expr (h2x/literal "T") (h2x/literal " ")]
-                                    (h2x/literal "Z") (h2x/literal "")]))
+                                (h2x/literal "Z") (h2x/literal "")]))
 
-;; 2026-09-08 review round-2 fix (engine probes P/Q-series, live df_cs_673150):
-;; generic text→temporal casts on MaxCompute. CAST(str AS datetime|timestamp)
-;; accepts ONLY 'yyyy-mm-dd hh:mi:ss[.fff]'; it silently returns NULL for
-;; colon-milliseconds ('hh:mi:ss:fff') and ' +0800' offset suffixes — a raw
-;; CAST(col AS timestamp) against log-style columns ('2026-09-06
-;; 14:16:33:452 +0800') compiles yet yields all-NULL. Probe-verified safe
-;; universal form: SUBSTR to the canonical 19 chars then cast. Point-fraction
-;; ISO strings keep their precision via the more-specific methods above.
+;; 2026-09-08 review round-2 fix (engine probes): CAST(str AS datetime|timestamp)
+;; on MaxCompute accepts ONLY 'yyyy-mm-dd hh:mi:ss[.fff]' — colon-milliseconds
+;; ('hh:mi:ss:fff') and ' +0800' suffix silently return NULL. Probe-verified safe
+;; universal form: SUBSTR to the canonical 19 chars, then cast.
 (defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/String->Temporal]
            [_driver _coercion-strategy expr]
            (h2x/->datetime [:substr expr [:inline 1] [:inline 19]]))
 
+;; No TIME type on MaxCompute — leave the generic cast (unsupported target).
+(defmethod sql.qp/cast-temporal-string [:maxcompute :Coercion/ISO8601->Time]
+           [_driver _semantic_type expr]
+           (h2x/->time expr))

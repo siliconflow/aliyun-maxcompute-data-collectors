@@ -873,9 +873,20 @@
 ;; (ODPS-0130071, E9 audit). Engine-verified path: TIMESTAMP(x, tz) works
 ;; (E8), CAST(TIMESTAMP(x, 'UTC') AS datetime) shifts the wall clock (S1):
 ;; from 12:34 → 20:34 with Asia/Shanghai target.
+;; MBQL 5 may carry a clause metadata map as the first argument (e.g. a
+;; percentile aggregation or expression renamed in the GUI arrives as
+;; [:percentile {name ...} expr 0.9]). Any custom ->honeysql implementation that
+;; destructures positional arguments must strip those maps first, otherwise the
+;; map is handed to ->honeysql and blows up with "Unexpected ->honeysql call on a
+;; map" (reproduced in production 2026-10-22).
+(defn- drop-clause-metadata
+       [clause]
+       (remove map? (rest clause)))
+
 (defmethod sql.qp/->honeysql [:maxcompute :convert-timezone]
-           [driver [_ arg target-timezone source-timezone]]
-           (let [hsql-form    (sql.qp/->honeysql driver arg)
+           [driver clause]
+           (let [[arg target-timezone source-timezone] (drop-clause-metadata clause)
+                 hsql-form    (sql.qp/->honeysql driver arg)
                  timestamptz? (h2x/is-of-type? hsql-form "timestamp")]
                 (sql.u/validate-convert-timezone-args timestamptz? target-timezone source-timezone)
                 (as-> (if timestamptz?
@@ -901,8 +912,9 @@
   (fn [_driver] :double))
 
 (defmethod sql.qp/->honeysql [:maxcompute :regex-match-first]
-           [driver [_ arg pattern]]
-           [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)])
+           [driver clause]
+           (let [[arg pattern] (drop-clause-metadata clause)]
+                [:regexp_extract (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver pattern)]))
 
 (defn- format-percentile
        [_tag [expr p :as _args]]
@@ -928,10 +940,6 @@
 ;; straight to ->honeysql failed with "Unexpected ->honeysql call on a map"
 ;; (reproduced 2026-10-22 through /api/dataset/native on the production instance).
 ;; Drop any map arguments before destructuring.
-(defn- drop-clause-metadata
-       [clause]
-       (remove map? (rest clause)))
-
 (defmethod sql.qp/->honeysql [:maxcompute :percentile]
            [driver clause]
            (let [[expr p] (drop-clause-metadata clause)]
@@ -1043,8 +1051,9 @@
                                :type  qp.error-type/invalid-query}))))
 
 (defmethod sql.qp/->honeysql [:maxcompute :datetime-diff]
-           [driver [_ x y unit]]
-           (let [x (sql.qp/->honeysql driver x)
+           [driver clause]
+           (let [[x y unit] (drop-clause-metadata clause)
+                 x (sql.qp/->honeysql driver x)
                  y (sql.qp/->honeysql driver y)]
                 (datetime-diff-check-args x y)
                 (sql.qp/datetime-diff driver unit x y)))
@@ -1390,8 +1399,9 @@
 
 ;; In MaxCompute, log syntax is `log(x, base)`
 (defmethod sql.qp/->honeysql [:maxcompute :log]
-           [driver [_ field]]
-           [:log [:inline 10] (sql.qp/->honeysql driver field)])
+           [driver clause]
+           (let [[field] (drop-clause-metadata clause)]
+                [:log [:inline 10] (sql.qp/->honeysql driver field)]))
 
 (defmethod sql.qp/quote-style :maxcompute
            [_driver]

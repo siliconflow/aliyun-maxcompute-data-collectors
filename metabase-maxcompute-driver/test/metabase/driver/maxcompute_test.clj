@@ -393,3 +393,27 @@
       (is (str/includes? i-str "'Z'"))
       (is (str/includes? (str/upper-case g-str) "GETDATE("))
       (is (not (str/includes? (str/upper-case g-str) "CURRENT_TIMESTAMP"))))))
+
+;; 2026-10-22 review fix — both composites below were only ever verified as
+;; hand-written SQL, so the driver's own rendering drifted: `:quarter` emitted
+;; the nonexistent `*-1(...)` function and backed off `(m-1)/3*3` months
+;; (Oct -> Jan 1), and `:day-of-week` handed `adjust-day-of-week` a
+;; Sunday-based value while `db-start-of-week` says :monday (Fri came back 7).
+(deftest ^:parallel quarter-and-day-of-week-sql-test
+  (let [expr (sql.qp/->honeysql :maxcompute
+                                [:field "x" {::add/source-table "t" ::add/source-alias "x"}])
+        q    (first (sql/format-expr (sql.qp/date :maxcompute :quarter expr) {:nested true}))
+        d    (first (sql/format-expr (sql.qp/date :maxcompute :day-of-week expr) {:nested true}))
+        qu   (str/upper-case q)
+        du   (str/upper-case d)]
+    (testing "quarter: DATEADD(DATETRUNC(x,'mm'), CAST(-1 * ((DATEPART(x,'mm')-1) % 3) AS BIGINT), 'mm')"
+      (is (str/includes? qu "DATEADD("))
+      (is (str/includes? qu "DATEPART("))
+      (is (str/includes? q "% 3"))
+      (is (str/includes? qu "AS BIGINT"))
+      (is (not (str/includes? q "*-1")) "`[:*-1 ...]` renders an invalid *-1(...) call"))
+    (testing "day-of-week: WEEKDAY composite (the 1..7 numbering itself is live-verified:
+              Mon=1 .. Sun=7, Fri=5; adjust-day-of-week then shifts it to the
+              instance start-of-week, so the rendered text is asserted loosely)"
+      (is (str/includes? du "WEEKDAY("))
+      (is (str/includes? du "% 7")))))

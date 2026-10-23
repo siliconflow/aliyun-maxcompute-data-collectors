@@ -258,6 +258,17 @@
 ;; this convert "a"."b"."c" to `a`.`b`.`c`, which is necessary for maxcompute
 (defmethod sql.qp/quote-style :maxcompute [_] :mysql)
 
+;; SQL that Metabase shows in the UI / query log goes through sql-formatter
+;; (`metabase.driver.sql.util/dialects`). There is no :maxcompute entry, so it
+;; falls back to StandardSql, which does not understand backtick identifiers and
+;; renders `tbl`.`col` as ` tbl `.` col ` — SQL that the engine rejects with
+;; ODPS-0130071 "column ... cannot be resolved" if a user copies it out of the UI.
+;; MaxCompute's quoting is MySQL-style, so format with that dialect.
+(add-optional-method!
+  'metabase.driver/prettify-native-form
+  :maxcompute
+  (fn [_driver s] (sql.u/format-sql :mysql s)))
+
 ;; 2026-09-08 engine-audit fix: without this, grouping by Week throws
 ;; "No method in multimethod 'db-start-of-week'". MaxCompute DATETRUNC 'week'
 ;; is Monday-based, which is Metabase's default start of week.

@@ -12,6 +12,7 @@
    [metabase.driver :as driver]
    [metabase.driver.maxcompute :as maxcompute]
    [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.sql.util :as sql.u]
    [metabase.query-processor.compile :as qp.compile]
    [metabase.lib.core :as lib]
    [metabase.lib.test-util :as lib.tu]
@@ -540,3 +541,20 @@
         (let [sql-text (compile-filter clause)]
           (is (str/includes? (str/upper-case sql-text) "LIKE"))
           (is (not (str/includes? (str/upper-case sql-text) "ESCAPE"))))))))
+
+;; 2026-10-23 deploy finding: the SQL Metabase displays/logs was formatted with
+;; sql-formatter's StandardSql dialect (no :maxcompute entry in
+;; metabase.driver.sql.util/dialects), which mangles backtick identifiers into
+;; ` tbl `.` col ` — invalid on the engine if a user copies it out of the UI.
+(deftest ^:parallel prettify-native-form-test
+  (let [fmt (get-method driver/prettify-native-form :maxcompute)
+        sql-in "SELECT `proj.schema.tbl`.`ds` AS `ds` FROM `proj.schema.tbl` LIMIT 3"
+        out    (fmt :maxcompute sql-in)]
+    (testing "backtick identifiers must not be padded with spaces"
+      ;; StandardSql (the fallback when a driver has no dialect) renders
+      ;; `tbl`.`col` as ` tbl `.` col `; a backtick must never be followed by
+      ;; whitespace in valid MaxCompute SQL.
+      (is (not (str/includes? out "` proj")))
+      (testing "and identifiers must keep their exact quoting"
+        (is (str/includes? out "`proj.schema.tbl`.`ds`"))
+        (is (str/includes? out "`proj.schema.tbl`"))))))

@@ -657,7 +657,7 @@
                ((get-method ->temporal-type :default) target-type clause))
              target-type))
 
-;; 2026-09-08 engine-audit fix (read-only tests on live project df_cs_673150):
+;; 2026-09-08 engine-audit fix (read-only tests on live project demo_project):
 ;; MaxCompute does NOT accept 'minute'/'second' as DATETRUNC/DATEADD datepart
 ;; tokens — only 'mi'/'ss' style short tokens, plus 'dd','hh','mm','yyyy',
 ;; 'day','month','year','week'. The 3-arg (timezone) form of DATETRUNC is also
@@ -754,7 +754,7 @@
               (recur unit (->temporal-type :timestamp expr))))
 
 ;; 2026-09-08 engine-audit fix: rewritten against engine-verified token set
-;; (live df_cs_673150). Changed units carry a note; unchanged ones were OK.
+;; (live demo_project). Changed units carry a note; unchanged ones were OK.
 (defmethod sql.qp/date [:maxcompute :second-of-minute] [_ _ expr] (extract :second    expr))
 (defmethod sql.qp/date [:maxcompute :minute]           [_ _ expr] (trunc   :minute    expr)) ; 'minute'->'mi' in format-trunc (was 0130071)
 (defmethod sql.qp/date [:maxcompute :minute-of-hour]   [_ _ expr] (extract :minute    expr))
@@ -951,7 +951,7 @@
 
 (sql/register-fn! ::percentile #'format-percentile)
 
-;; 2026-10-22 engine-verified (live df_cs_673150): PERCENTILE(x, p) is the native
+;; 2026-10-22 engine-verified (live demo_project): PERCENTILE(x, p) is the native
 ;; form and takes p as a 0..1 fraction — 1..10 gives p50=5.5 / p90=9.1, and
 ;; MEDIAN(x) == PERCENTILE(x, 0.5). The previous implementation emitted
 ;; APPROX_QUANTILES(x, n)[OFFSET(k)], a BigQuery function this engine does not

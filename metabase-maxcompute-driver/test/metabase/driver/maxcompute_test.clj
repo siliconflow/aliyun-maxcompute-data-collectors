@@ -27,7 +27,7 @@
   (testing "The maxcompute namespace loads without throwing (validates ns declaration, requires, register!)"
     (is (some? (find-ns 'metabase.driver.maxcompute)))))
 
-;; 2026-09-08 production incident (bi.siliconflow.cn v0.63.16.6 + driver v0.0.6):
+;; 2026-09-08 production incident (metabase.example.invalid v0.63.16 + driver v0.0.6):
 ;; table browse / simple data select rendered SQL with EMPTY select expressions
 ;; (…SELECT AS `_key_`…) and a one-blob FROM `project.db.table`. Guard the full
 ;; pipeline (field refs -> add-alias-info -> top-level clauses -> rendered SQL)
@@ -41,7 +41,7 @@
     (lib.tu/mock-metadata-provider
       {:database {:lib/type :metadata/database, :id 1 :name "test-mc" :engine :maxcompute
                   :details db-details}
-       :tables   [{:lib/type :metadata/table, :id 100 :name "inference_detail_inputs" :schema "df_cs"}]
+       :tables   [{:lib/type :metadata/table, :id 100 :name "sample_events" :schema "demo"}]
        :fields   [{:lib/type :metadata/column, :id 1001 :name "_key_"      :table-id 100 :base-type :type/Text}
                   {:lib/type :metadata/column, :id 1002 :name "_timestamp_" :table-id 100
                    :base-type :type/BigInteger :effective-type :type/DateTime
@@ -56,12 +56,12 @@
 
 (deftest integration-table-browse-sql-test
   (testing "table-browse MBQL query compiles to well-formed SQL: every field renders an expression, FROM is two-part"
-    (let [sql (compile-simple-table-query {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"})]
+    (let [sql (compile-simple-table-query {:project "demo_project" :endpoint "http://x" :ak "a" :sk "b"})]
       (testing "no empty SELECT expressions (the incident's `SELECT AS `_key_``)"
         (is (str/includes? sql "_key_"))
         (is (not (re-matches #"(?s).*SELECT +(AS|,).*" sql)) "select list must not be empty"))
       (testing "FROM identifier must not be a single-blob `project.db.table`"
-        (is (not (str/includes? sql "`df_cs_673150.df_cs_673150.inference_detail_inputs`")))))))
+        (is (not (str/includes? sql "`demo_project.demo_project.sample_events`")))))))
 
 (deftest ^:parallel driver-registered-test
   (testing ":maxcompute is registered with :sql-jdbc parent (derives from :sql as well)"
@@ -69,7 +69,7 @@
     ;; state check that requires `driver/initialize!` to have run, which doesn't happen in unit tests.
     ;; 2026-09-08 incident fix: the driver must NOT derive from :sql-mbql5 —
     ;; its clause-order forwarding shims corrupt legacy 3-tuple :field clauses
-    ;; on v0.63.x (identifiers render with empty components; the bi.siliconflow.cn
+    ;; on v0.63.x (identifiers render with empty components; the metabase.example.invalid
     ;; production breakage). See register comment in maxcompute.clj.
     (is (isa? driver/hierarchy :maxcompute :sql-jdbc))
     (is (isa? driver/hierarchy :maxcompute :sql))
@@ -105,22 +105,22 @@
           (is (re-matches #".*_[0-9a-f]{8}$" escaped)
               (str (pr-str input) " -> " (pr-str escaped) " lacks CRC32 suffix")))))))
 
-;; 2026-09-08 second production incident (bi.siliconflow.cn v0.63.16.6 + driver
-;; v0.0.7): the 6-join card 432 compiles fine, but core add-alias-info uniquifies
+;; 2026-09-08 second production incident (metabase.example.invalid v0.63.16 + driver
+;; v0.0.7): the 6-join production card compiles fine, but core add-alias-info uniquifies
 ;; join aliases BEFORE escaping, so THREE distinct Chinese aliases
 ;; (个人认证记录/机构认证信息/累计其他消费) all folded to `___________user_id` and
 ;; MaxCompute rejected the SQL with ODPS-0130071 (ambiguous column). This test
 ;; compiles a production-shaped 6-join query end-to-end and asserts per-join
 ;; escape uniqueness at the SQL level.
 (defn- compile-6-join-query
-  "Compiles an MBQL query shaped like card 432 (source table + 6 left joins onto
+  "Compiles an MBQL query shaped like the production card (source table + 6 left joins onto
    sibling tables, each join pulling one field) to native SQL. Join aliases mirror
    production exactly."
   []
   (let [mp (lib.tu/mock-metadata-provider
              {:database {:lib/type :metadata/database, :id 1 :name "test-mc" :engine :maxcompute
-                         :details {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"}}
-              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "df_cs"}
+                         :details {:project "demo_project" :endpoint "http://x" :ak "a" :sk "b"}}
+              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "demo"}
                          {:lib/type :metadata/table, :id 101 :name "personal_verify"}
                          {:lib/type :metadata/table, :id 102 :name "org_verify"}
                          {:lib/type :metadata/table, :id 103 :name "charge_refund_stats"}
@@ -174,7 +174,7 @@
 
 (deftest ^:parallel escape-alias-disambiguation-test
   (testing "distinct non-ASCII aliases that fold identically escape to distinct identifiers
-            (production incident: card 432 on bi.siliconflow.cn, ODPS-0130071 ambiguous join alias)"
+            (production incident: 6-join card, ODPS-0130071 ambiguous join alias)"
     (let [prod-aliases ["用户个人认证记录 - user_id"
                         "用户机构认证信息 - user_id"
                         "用户充值退款累计统计 - user_id"
@@ -398,7 +398,7 @@
       (is (str/includes? (str/upper-case g-str) "GETDATE("))
       (is (not (str/includes? (str/upper-case g-str) "CURRENT_TIMESTAMP"))))))
 
-;; 2026-10-22 capability gap fills (engine-verified against live df_cs_673150).
+;; 2026-10-22 capability gap fills (engine-verified against live demo_project).
 ;; The feature flags flipped in this round are :percentile-aggregations,
 ;; :standard-deviation-aggregations, :advanced-math-expressions, :regex,
 ;; :binning, :full-join and :convert-timezone. `driver/database-supports?`
@@ -443,8 +443,8 @@
 (deftest ^:parallel nested-query-qualification-test
   (let [mp (lib.tu/mock-metadata-provider
              {:database {:lib/type :metadata/database, :id 1 :name "test-mc" :engine :maxcompute
-                         :details {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"}}
-              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "df_cs"}]
+                         :details {:project "demo_project" :endpoint "http://x" :ak "a" :sk "b"}}
+              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "demo"}]
               :fields   [{:lib/type :metadata/column, :id 1001 :name "user_id" :table-id 100 :base-type :type/Text}
                          {:lib/type :metadata/column, :id 1002 :name "created_at" :table-id 100 :base-type :type/BigInteger}]})
         sql-text (qp.store/with-metadata-provider mp
@@ -458,9 +458,9 @@
                                                     :fields [[:field 1001 nil] [:field 1002 nil]]}
                                      :aggregation [[:count]]
                                      :breakout    [[:field "user_id" {:base-type :type/Text}]]}}))))]
-    (is (str/includes? sql-text "`df_cs_673150.df_cs.users`.`user_id`")
+    (is (str/includes? sql-text "`demo_project.demo.users`.`user_id`")
         "inner columns must be qualified with <project>.<schema>.<table> as one identifier")
-    (is (not (str/includes? sql-text "`df_cs`.`users`.`")))))
+    (is (not (str/includes? sql-text "`demo.users`.`")))))
 
 
 ;; 2026-10-22 review fix — both composites below were only ever verified as
@@ -521,8 +521,8 @@
 (deftest ^:parallel like-filter-sql-test
   (let [mp (lib.tu/mock-metadata-provider
              {:database {:lib/type :metadata/database, :id 1 :name "mc" :engine :maxcompute
-                         :details {:project "df_cs_673150" :endpoint "http://x" :ak "a" :sk "b"}}
-              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "df_cs"}]
+                         :details {:project "demo_project" :endpoint "http://x" :ak "a" :sk "b"}}
+              :tables   [{:lib/type :metadata/table, :id 100 :name "users" :schema "demo"}]
               :fields   [{:lib/type :metadata/column, :id 1001 :name "ds" :table-id 100
                           :base-type :type/Text :effective-type :type/Text}]})
         compile-filter (fn [clause]
